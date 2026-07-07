@@ -1,0 +1,45 @@
+# Build output: ignore everything in dist/ EXCEPT the shipped exe (which is pushed to the repo).
+# (A parent dir must not be excluded outright, or the negation below can't re-include the file.)
+dist/*
+!dist/HYCUADRecovery.exe
+
+# Runtime data (never commit: may contain AD data)
+staging/
+Logs/
+reports/
+*.dit
+*.log
+edb*.jrs
+edb.chk
+*.ldif
+*.INTEG.RAW
+
+# Local profiles & secrets (DPAPI-encrypted, but machine/user specific)
+profiles/
+*.profile.xml
+
+# Test output / artifacts
+Tests/Results/
+*.TestResults.xml
+testresults*.xml
+
+# Misc OS / editors
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.tmp
+*~
+
+# Internal / assistant / optional files - kept locally, NOT pushed to GitHub
+# (.gitignore does not support end-of-line comments, so keep patterns on their own lines)
+# .claude/     = Claude Code local settings (machine/permission-specific)
+# memory.md    = internal AI project-memory working notes
+# CLAUDE.md    = project rules written for the AI assistant
+# Examples.ps1 = usage examples (not needed to run or build the tool)
+# Build-Exe.ps1 = portable-folder build variant (redundant with Build-SingleExe.ps1)
+.claude/
+memory.md
+CLAUDE.md
+Examples.ps1
+Build-Exe.ps1

@@ -191,7 +191,14 @@ Describe 'Wait-HYCURestoredNtds (ntds.dit detection)' {
     It 'throws if ntds.dit does not appear before the timeout' {
         $tmp = Join-Path $env:TEMP ('hycu_test_' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-        try { { Wait-HYCURestoredNtds -Path $tmp -TimeoutSeconds 2 -PollSeconds 1 } | Should Throw }
+        try {
+            # Explicit try/catch instead of `| Should Throw`: Pester 3.4's Should Throw misses the
+            # exception under PowerShell 7 (it predates PS Core) - see the same pattern in
+            # HYCUADRecovery.Tests.ps1 (empty-token profile test).
+            $threw = $false
+            try { Wait-HYCURestoredNtds -Path $tmp -TimeoutSeconds 2 -PollSeconds 1 } catch { $threw = $true }
+            $threw | Should Be $true
+        }
         finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

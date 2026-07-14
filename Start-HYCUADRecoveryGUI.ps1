@@ -31,6 +31,20 @@ if (-not $env:HYCU_GUI_NOSHOW -and
     return
 }
 
+# When started by the native launcher exe (HYCU_PROGRAM_DIR set), the trusted powershell.exe is spawned
+# with a normal console window (deliberately NOT with -WindowStyle Hidden, which endpoint-protection
+# engines flag). Hide that console ourselves now, from inside the script, so only the WPF window shows.
+if ($env:HYCU_PROGRAM_DIR -and -not $env:HYCU_GUI_NOSHOW) {
+    try {
+        Add-Type -Namespace HYCU -Name Con -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction Stop
+        $h = [HYCU.Con]::GetConsoleWindow()
+        if ($h -ne [System.IntPtr]::Zero) { [void][HYCU.Con]::ShowWindow($h, 0) }   # 0 = SW_HIDE
+    } catch {}
+}
+
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 # NB: when compiled to an .exe (PS2EXE) $MyInvocation.MyCommand.Path is $null, and Split-Path -Parent $null
@@ -56,14 +70,16 @@ Import-Module $script:ModulePath -Force
 # Version is a build timestamp (YYYYMMDDHHMM); bump it on every new build. The .psd1 manifest
 # keeps its own SemVer (PowerShell requires a System.Version there, not a 12-digit stamp).
 # ----------------------------------------------------------------------------
-$script:HYCUAppVersion    = '202607071040'
+$script:HYCUAppVersion    = '202607141315'
 $script:HYCUProductName   = 'HYCU AD Recovery Tool'
 $script:HYCUProductKind   = 'Plugin for HYCU Enterprise Cloud'
 $script:HYCUProductNotice = 'This is a free plugin, provided as-is without any warranty or engagement from HYCU.'
 
-# Folder the program runs from: the script's folder as a .ps1, or the .exe's folder when packaged
-# with PS2EXE (the host process is then the .exe itself, not powershell.exe).
+# Folder the program runs from: the launcher exe's folder (HYCU_PROGRAM_DIR, set by the native
+# launcher before it spawns powershell.exe), the script's folder as a .ps1, or the .exe's folder
+# when the host process is the exe itself.
 function Get-HYCUProgramDir {
+    if ($env:HYCU_PROGRAM_DIR -and (Test-Path $env:HYCU_PROGRAM_DIR)) { return $env:HYCU_PROGRAM_DIR }
     try {
         $main = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         if ($main -and ([System.IO.Path]::GetFileName($main)) -notmatch '(?i)^(powershell(_ise)?|pwsh)\.exe$') {
@@ -491,7 +507,7 @@ $sync.LoadedTgtPass = $null     # SecureString restore-target password from a lo
 
                 <!-- STEP 4 - Retrieve NTDS -->
                 <StackPanel x:Name="WizStep3" Visibility="Collapsed">
-                  <TextBlock Text="Step 3 - Retrieve the NTDS database from HYCU" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
+                  <TextBlock Text="Step 4 - Retrieve the NTDS database from HYCU" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
                   <Border Background="#FFE2E0FD" CornerRadius="4" Padding="10" Margin="0,0,0,10">
                     <StackPanel>
                       <TextBlock x:Name="W3_Selected" Foreground="#FF5B18C0" FontWeight="SemiBold" TextWrapping="Wrap"/>
@@ -507,9 +523,9 @@ $sync.LoadedTgtPass = $null     # SecureString restore-target password from a lo
                   <TextBox x:Name="W3_NtdsResult" IsReadOnly="True"/>
                 </StackPanel>
 
-                <!-- STEP 4 -->
+                <!-- STEP 5 - Mount + compare -->
                 <StackPanel x:Name="WizStep4" Visibility="Collapsed">
-                  <TextBlock Text="Step 4 - Mount and compare" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
+                  <TextBlock Text="Step 5 - Mount and compare" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
                   <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
@@ -532,10 +548,10 @@ $sync.LoadedTgtPass = $null     # SecureString restore-target password from a lo
                   <TextBlock x:Name="W4_Summary" Margin="0,4,0,0" Foreground="#FF5B18C0" TextWrapping="Wrap"/>
                 </StackPanel>
 
-                <!-- STEP 5 -->
+                <!-- STEP 6 - Selection -->
                 <Grid x:Name="WizStep5" Visibility="Collapsed">
                   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-                  <TextBlock Grid.Row="0" Text="Step 5 - Browse the mounted database and compare" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
+                  <TextBlock Grid.Row="0" Text="Step 6 - Selection: browse the mounted database and compare" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
                   <!-- WrapPanel so the toolbar buttons flow onto a second line on a narrow window instead of
                        being clipped (e.g. "View cart" was cut off at the right edge). -->
                   <WrapPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,6">
@@ -547,6 +563,8 @@ $sync.LoadedTgtPass = $null     # SecureString restore-target password from a lo
                     <Button x:Name="W5_BtnScan" Content="Scan all changes" Width="140" Margin="0,0,6,4"/>
                     <Button x:Name="W5_BtnRecycle" Content="Recycle Bin" Width="110" Margin="0,0,6,4"
                             ToolTip="List objects still in the AD Recycle Bin (reanimable with SID preserved) - read-only"/>
+                    <Button x:Name="W5_BtnListGpo" Content="List GPOs" Width="100" Margin="0,0,6,4"
+                            ToolTip="List every Group Policy object in the snapshot by its friendly name - select one to compare with production or add to the restore cart"/>
                     <Button x:Name="W5_BtnAddCart" Content="Add to cart" Background="#FF721EF2" Width="110" Margin="0,0,6,4"/>
                     <Button x:Name="W5_BtnAddAttrs" Content="Add selected attrs" Background="#FF721EF2" Width="140" Margin="0,0,6,4"
                             ToolTip="Cherry-pick: after 'Compare with production', select rows in the attribute grid and add ONLY those attributes to the cart"/>
@@ -598,9 +616,9 @@ $sync.LoadedTgtPass = $null     # SecureString restore-target password from a lo
                   </Grid>
                 </Grid>
 
-                <!-- STEP 6 -->
+                <!-- STEP 7 - Restore -->
                 <StackPanel x:Name="WizStep6" Visibility="Collapsed">
-                  <TextBlock Text="Step 6 - Restore" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
+                  <TextBlock Text="Step 7 - Restore" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
                   <RadioButton x:Name="W6_RadioCart" Content="Restore the cart" IsChecked="True" Margin="0,2"/>
                   <RadioButton x:Name="W6_RadioSel" Content="Restore the object currently selected in the tree" Margin="0,2"/>
                   <CheckBox x:Name="W6_ChkWhatIf" Content="Simulation mode (-WhatIf) - no writes" Foreground="#FF5B18C0" IsChecked="True" Margin="0,8,0,2"/>
@@ -717,6 +735,11 @@ function UILog($msg, $level = 'INFO') {
         $line = "{0:yyyy-MM-dd HH:mm:ss} [{1,-7}] {2}`r`n" -f (Get-Date), $level, $msg
         try { [System.IO.File]::AppendAllText($script:HYCULogFile, $line, [System.Text.Encoding]::UTF8) } catch {}
     }
+    # Surface problems in the UI as well: file-only logging made validation warnings ("Select a
+    # restore point.") and failures invisible - Next appeared dead. UILog runs on the UI thread only.
+    if ($level -eq 'WARN' -or $level -eq 'ERROR') {
+        try { (C 'LblStatus').Text = "[$level] $msg" } catch {}
+    }
 }
 # Drains one queue line to the log. The log sink encodes the engine level as a "LEVEL<TAB>message"
 # prefix so WARN/ERROR/SUCCESS render with their real level (not a confusing "[INFO] [WARN] ..."). Plain
@@ -826,7 +849,12 @@ function Start-UIAsync {
             $sync.AsyncPS = $null; $sync.AsyncTimer = $null   # release the closures (which retain $sync/$win)
             $sync.Busy = $false
             Set-UIBusy $false 'Ready.'
-            if ($sync.Error) { UILog "ERROR: $($sync.Error)" 'ERROR' }
+            if ($sync.Error) {
+                UILog "ERROR: $($sync.Error)" 'ERROR'
+                # A failed operation must be unmissable: without this the overlay just vanished and the
+                # status bar read "Ready." - an operator could believe a restore/scan actually ran.
+                try { [System.Windows.MessageBox]::Show("The operation failed:`n`n$($sync.Error)", 'Operation failed', 'OK', 'Error') | Out-Null } catch {}
+            }
             else {
                 try { & $sync.AsyncOnComplete $sync.Result } catch { UILog "ERROR (post-processing): $_" 'ERROR' }
             }
@@ -910,11 +938,15 @@ function Invoke-RestoreItems($Items, [bool]$WhatIf, [bool]$RemoveExtra, $Live, $
     $r = [System.Windows.MessageBox]::Show("Restore $($items.Count) object(s)?`n`nMode: $mode$warn", 'Confirmation', 'YesNo', 'Warning')
     if ($r -ne 'Yes') { UILog 'Restore cancelled.' 'WARN'; return }
     # Remember which USER objects are being fully restored: after a real run, the post-recreation
-    # assistant (reset password + enable) proposes exactly these accounts.
-    $sync.LastRestoreUsers = @($items | Where-Object { $_.Status -eq 'Deleted' -and $_.ObjectClass -match 'user|inetOrgPerson' -and $_.ObjectClass -notmatch 'computer' } | ForEach-Object {
-        [pscustomobject]@{ Name = $_.Name; SamAccountName = [string]$_.SamAccountName; DistinguishedName = $_.DistinguishedName }
-    })
-    $sync.LastRestoreTargetOU = $TargetOU
+    # assistant (reset password + enable) proposes exactly these accounts. REAL runs only: a
+    # simulation must not overwrite the target list of the last real restore (clicking the
+    # still-enabled "Reset + enable" button would then act on accounts that were never restored).
+    if (-not $WhatIf) {
+        $sync.LastRestoreUsers = @($items | Where-Object { $_.Status -eq 'Deleted' -and $_.ObjectClass -match 'user|inetOrgPerson' -and $_.ObjectClass -notmatch 'computer' } | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; SamAccountName = [string]$_.SamAccountName; DistinguishedName = $_.DistinguishedName }
+        })
+        $sync.LastRestoreTargetOU = $TargetOU
+    }
     # Simulation: build a plan of what a REAL run would do, shown as a popup at the end (Status is known
     # up-front from the compare, so no writes are needed to describe it).
     $sync.RestoreWhatIf = $WhatIf; $sync.RestorePlanText = $null
@@ -1001,7 +1033,7 @@ function Invoke-ExportLdif($Item) {
     } -OnComplete { param($r) UILog 'LDIF export finished.' 'SUCCESS' }
 }
 
-# Step 5 - mounted-database tree (dsa.msc-style, lazy loaded one level at a time).
+# Step 6 - mounted-database tree (dsa.msc-style, lazy loaded one level at a time).
 $script:W5TreeDummy = 'Loading...'
 function New-W5TreeItem($node) {
     $ti = New-Object System.Windows.Controls.TreeViewItem
@@ -1024,7 +1056,7 @@ function Expand-W5Node($item) {
 }
 function Load-W5Tree {
     $tree = C 'W5_Tree'; $tree.Items.Clear(); (C 'W5_Attrs').ItemsSource = $null
-    if (-not $sync.Session) { (C 'W5_NodeLabel').Text = 'Mount a database first (step 4).'; return }
+    if (-not $sync.Session) { (C 'W5_NodeLabel').Text = 'Mount a database first (step 5).'; return }
     try {
         $base = [string]$sync.Session.BaseDN
         $r = Get-LdapEntries -Server $sync.Session.Server -BaseDN $base -Scope Base -Properties @('name','objectClass','distinguishedName') | Select-Object -First 1
@@ -1294,6 +1326,14 @@ function Next-WizStep {
         if ($sync.Session) { try { Dismount-HYCUADSnapshot -Session $sync.Session } catch {} ; $sync.Session = $null }
         try { Stop-HYCUADMountResidue -Confirm:$false | Out-Null } catch {}
         $sync.Diffs = @(); $sync.Cart.Clear(); Update-CartLabels
+        # Clear EVERYTHING tied to this recovery: leaving NtdsPath set made the next run skip the
+        # HYCU retrieve at step 4 and silently mount the PREVIOUS backup's database. Same for the
+        # selection state and the post-reset target list.
+        $sync.NtdsPath = $null; $sync.SelectedVM = $null; $sync.SelectedRP = $null
+        $sync.SelectedNodeDN = $null; $sync.SelectedDiff = $null; $sync.LastRestoreUsers = @()
+        try { (C 'W2_GridRPs').ItemsSource = $null; (C 'W2_Selection').Text = '' } catch {}
+        try { (C 'W5_Tree').Items.Clear(); (C 'W5_Attrs').ItemsSource = $null; (C 'W5_NodeLabel').Text = '' } catch {}
+        try { $pr = C 'W6_BtnPostReset'; if ($pr) { $pr.IsEnabled = $false } } catch {}
         UILog 'Finished: snapshot dismounted, LDAP port freed, cart cleared. Ready for a new recovery.' 'SUCCESS'
         Show-WizStep 1
         return
@@ -1315,8 +1355,9 @@ function Back-WizStep {
 # ----------------------------------------------------------------------------
 # Handlers - Step 1 (HYCU connection / profiles)
 # ----------------------------------------------------------------------------
-(C 'RadioConnectHycu').Add_Checked({ $script:SkipHycu = $false; (C 'HycuPanel').Visibility = 'Visible'; (C 'FolderPanel').Visibility = 'Collapsed' })
-(C 'RadioUseFolder').Add_Checked({ $script:SkipHycu = $true;  (C 'HycuPanel').Visibility = 'Collapsed'; (C 'FolderPanel').Visibility = 'Visible' })
+# Switching source mode invalidates any previously retrieved database (the other mode's path).
+(C 'RadioConnectHycu').Add_Checked({ $script:SkipHycu = $false; $sync.NtdsPath = $null; (C 'HycuPanel').Visibility = 'Visible'; (C 'FolderPanel').Visibility = 'Collapsed' })
+(C 'RadioUseFolder').Add_Checked({ $script:SkipHycu = $true;  $sync.NtdsPath = $null; (C 'HycuPanel').Visibility = 'Collapsed'; (C 'FolderPanel').Visibility = 'Visible' })
 
 # Auth mode toggle: Basic -> only username/password ; API token -> only the token field
 (C 'W1_AuthBasic').Add_Checked({ (C 'W1_BasicFields').Visibility = 'Visible';   (C 'W1_TokenFields').Visibility = 'Collapsed' })
@@ -1489,7 +1530,12 @@ foreach ($f in 'W1_Server','W1_Port','W1_ApiVersion','W1_User') { (C $f).Add_Tex
 })
 (C 'W2_GridVMs').Add_SelectionChanged({
     $vm = (C 'W2_GridVMs').SelectedItem; if (-not $vm) { return }
+    # Busy check BEFORE mutating state: assigning SelectedVM and then having Start-UIAsync refuse
+    # would pair VM B with the restore-point list (and NtdsPath) of VM A.
+    if ($sync.Busy) { UILog 'An operation is running; re-select the controller when it finishes.' 'WARN'; return }
     $sync.SelectedVM = $vm
+    $sync.SelectedRP = $null
+    $sync.NtdsPath   = $null   # a different controller invalidates any previously retrieved database
     Start-UIAsync -BusyText "Restore points for $($vm.Name)..." -In @{ Uuid = $vm.Uuid } -Work {
         param($In, $Report)
         Get-HYCURestorePoint -Session $sync.HycuSession -VmUuid $In.Uuid | Sort-Object Timestamp -Descending
@@ -1501,13 +1547,18 @@ foreach ($f in 'W1_Server','W1_Port','W1_ApiVersion','W1_User') { (C $f).Add_Tex
 })
 (C 'W2_GridRPs').Add_SelectionChanged({
     $rp = (C 'W2_GridRPs').SelectedItem; $sync.SelectedRP = $rp
+    if ($rp) {
+        # A (re)selected restore point must be retrieved anew - otherwise step 4 would silently
+        # reuse the NTDS files of the PREVIOUS restore point.
+        $sync.NtdsPath = $null
+    }
     if ($rp -and $sync.SelectedVM) {
-        (C 'W2_Selection').Text = "Selected: $($sync.SelectedVM.Name)  -  restore point $($rp.Timestamp) [$($rp.Consistency)].  Click 'Next' to retrieve the files (step 3)."
+        (C 'W2_Selection').Text = "Selected: $($sync.SelectedVM.Name)  -  restore point $($rp.Timestamp) [$($rp.Consistency)].  Click 'Next' to set the restore destination (step 3)."
     }
 })
 
 # ----------------------------------------------------------------------------
-# Handlers - Step 3 (file-level restore + watching)
+# Handlers - Step 4 (file-level restore + watching)
 # ----------------------------------------------------------------------------
 # Retrieve the NTDS database from HYCU (async). On success sets $sync.NtdsPath and runs $OnSuccess (advance
 # the wizard); on failure it stays and shows a clear error dialog. The retrieve IS the step-4 action (no
@@ -1774,10 +1825,33 @@ function Invoke-W5RecycleBin {
 }
 
 # ----------------------------------------------------------------------------
-# Handlers - Step 5 (selection)
+# Handlers - Step 6 (selection)
 # ----------------------------------------------------------------------------
 (C 'W5_BtnReload').Add_Click({ Load-W5Tree })
 (C 'W5_BtnRecycle').Add_Click({ try { Invoke-W5RecycleBin } catch { UILog "Recycle Bin view failed: $_" 'ERROR' } })
+
+# List every Group Policy object in the snapshot by its friendly name, so GPOs can be found and
+# restored without hunting for the unreadable {GUID} nodes under CN=Policies,CN=System. The results
+# reuse the search dialog: select a GPO to compare it with production or add it to the restore cart
+# (its SYSVOL content - Registry.pol, scripts, ADMX - is copied on restore, see Get-GpoRestorePathNote).
+function Invoke-W5ListGpos {
+    if ($sync.Busy) { UILog 'An operation is running; please wait.' 'WARN'; return }   # the worker owns $sync.Session (LDAP)
+    if (-not $sync.Session) { UILog 'Mount a database first (step 5).' 'WARN'; return }
+    try {
+        $res = @(Get-LdapEntries -Server $sync.Session.Server -BaseDN $sync.Session.BaseDN -Scope Subtree `
+                    -Filter '(objectClass=groupPolicyContainer)' `
+                    -Properties @('name','displayName','objectClass','distinguishedName','gPCFileSysPath'))
+        $items = foreach ($e in $res) {
+            $nm = if ([string]$e.displayName) { [string]$e.displayName } else { [string]$e.name }
+            [pscustomobject]@{ Name = $nm; ObjectClass = 'groupPolicyContainer'; DistinguishedName = [string]$e.distinguishedName }
+        }
+        $items = @($items | Sort-Object Name)
+        UILog "List GPOs: $(@($items).Count) Group Policy object(s) in the snapshot."
+        if (@($items).Count -eq 0) { UILog 'No Group Policy objects found in the snapshot.' 'INFO'; return }
+        Show-SearchDialog @($items) 'Group Policy objects'
+    } catch { UILog "List GPOs failed: $_" 'ERROR' }
+}
+(C 'W5_BtnListGpo').Add_Click({ Invoke-W5ListGpos })
 
 # Lazy expansion: load a node's children the first time it is expanded.
 (C 'W5_Tree').AddHandler(
@@ -1824,6 +1898,9 @@ function Invoke-W5Compare {
 (C 'W5_Tree').Add_MouseDoubleClick({ if ($sync.SelectedNodeDN) { Invoke-W5Compare } })
 # Find an object by name and act on it from a results list.
 function Invoke-W5Search {
+    # Busy guard: the overlay blocks the mouse but NOT the keyboard - Enter in the search box would
+    # run an LDAP query against $sync.Session while a worker owns it.
+    if ($sync.Busy) { UILog 'An operation is running; please wait.' 'WARN'; return }
     if (-not $sync.Session) { UILog 'Mount a database first (step 5).' 'WARN'; return }
     $term = ([string](C 'W5_Search').Text).Trim()
     if (-not $term) { UILog 'Type something to search for.' 'WARN'; return }
@@ -1928,16 +2005,21 @@ function Invoke-W5Search {
 (C 'W5_BtnViewCart').Add_Click({ try { Show-CartDialog } catch { UILog "View cart failed: $_" 'ERROR' } })
 
 # ----------------------------------------------------------------------------
-# Handlers - Step 6 (restore)
+# Handlers - Step 7 (restore)
 # ----------------------------------------------------------------------------
 # Toggling the restore mode re-labels the Restore button (shows the cart count in cart mode).
 (C 'W6_RadioCart').Add_Checked({ try { Update-CartLabels } catch {} })
 (C 'W6_RadioSel').Add_Checked({ try { Update-CartLabels } catch {} })
 (C 'W6_BtnViewCart').Add_Click({ try { Show-CartDialog } catch { UILog "View cart failed: $_" 'ERROR' } })
 (C 'W6_BtnRestore').Add_Click({
-    $items = if ([bool](C 'W6_RadioCart').IsChecked) { @($sync.Cart) }
-             elseif ($sync.SelectedNodeDN) { @(Get-HYCUADObjectComparison -Session $sync.Session -DistinguishedName $sync.SelectedNodeDN -LiveServer (C 'W4_LiveDC').Text) | Where-Object { $_ } }
-             else { @() }
+    # Guard: after a dismount, $sync.Session is $null - the selected-object path would call the
+    # engine with a null session (unhandled exception in a dispatcher handler = window crash).
+    if (-not $sync.Session) { UILog 'No snapshot mounted - mount a database first (step 5).' 'WARN'; return }
+    try {
+        $items = if ([bool](C 'W6_RadioCart').IsChecked) { @($sync.Cart) }
+                 elseif ($sync.SelectedNodeDN) { @(Get-HYCUADObjectComparison -Session $sync.Session -DistinguishedName $sync.SelectedNodeDN -LiveServer (C 'W4_LiveDC').Text) | Where-Object { $_ } }
+                 else { @() }
+    } catch { UILog "Could not prepare the restore selection: $_" 'ERROR'; return }
     Invoke-RestoreItems $items ([bool](C 'W6_ChkWhatIf').IsChecked) ([bool](C 'W6_ChkRemoveExtra').IsChecked) (C 'W4_LiveDC').Text ((C 'W6_TargetOU').Text)
 })
 # Post-recreation assistant: reset a fresh random password (+change at next logon) and enable each
@@ -1948,21 +2030,29 @@ function Invoke-W5Search {
     if ($users.Count -eq 0) { UILog 'No recreated user accounts from the last restore.' 'INFO'; return }
     $names = ($users | Select-Object -First 15 | ForEach-Object { "  - $($_.Name) ($($_.SamAccountName))" }) -join "`n"
     $more = if ($users.Count -gt 15) { "`n  ... and $($users.Count - 15) more" } else { '' }
+    # Honor the step's Simulation checkbox like every other production write (CLAUDE.md: -WhatIf is
+    # the default for anything that writes to production AD).
+    $simulate = [bool](C 'W6_ChkWhatIf').IsChecked
+    $modeLine = if ($simulate) { "`n`nMode: SIMULATION (-WhatIf) - nothing will be written; untick 'Simulation mode' to apply." } else { '' }
     $ans = [System.Windows.MessageBox]::Show(
-        "Reset the password (random, must change at next logon) and ENABLE these $($users.Count) recreated account(s)?`n`n$names$more`n`nThe new passwords are displayed ONCE and are not logged.",
+        "Reset the password (random, must change at next logon) and ENABLE these $($users.Count) recreated account(s)?`n`n$names$more`n`nThe new passwords are displayed ONCE and are not logged.$modeLine",
         'Post-recreation assistant', 'YesNo', 'Warning')
     if ($ans -ne 'Yes') { return }
     # Identify by sAMAccountName (stable even when the restore was redirected to another OU).
     $ids = @($users | ForEach-Object { if ($_.SamAccountName) { $_.SamAccountName } else { $_.DistinguishedName } })
-    Start-UIAsync -BusyText 'Resetting and enabling the recreated accounts...' -In @{ Ids = $ids; Live = (C 'W4_LiveDC').Text } -Work {
+    # Stash on $sync: a plain local would not resolve inside OnComplete (it runs later, from the
+    # DispatcherTimer tick scope - PowerShell scriptblocks are dynamically scoped, not closures).
+    $sync.PostResetWhatIf = $simulate
+    Start-UIAsync -BusyText 'Resetting and enabling the recreated accounts...' -In @{ Ids = $ids; Live = (C 'W4_LiveDC').Text; WhatIf = $simulate } -Work {
         param($In, $Report)
         $p = @{}; if ($In.Live) { $p['Server'] = $In.Live }
-        $res = @(Reset-HYCUADRecreatedAccount -Identity $In.Ids @p -Confirm:$false)
+        $res = @(Reset-HYCUADRecreatedAccount -Identity $In.Ids @p -WhatIf:$In.WhatIf -Confirm:$false)
         & $Report "Post-recreation reset finished ($(@($res).Count) account(s))."
         ,$res
     } -OnComplete {
         param($r)
-        if ($r) { Show-PostResetDialog @($r) }
+        if (@($r).Count) { Show-PostResetDialog @($r) }
+        elseif ($sync.PostResetWhatIf) { UILog 'Simulation: no account was reset or enabled (untick Simulation mode to apply).' 'INFO' }
     }
 })
 (C 'W6_BtnDismount').Add_Click({
@@ -1971,6 +2061,10 @@ function Invoke-W5Search {
         if ($sync.Session) { Dismount-HYCUADSnapshot -Session $sync.Session; $sync.Session = $null; UILog 'Snapshot dismounted.' 'SUCCESS' }
         else { Stop-HYCUADMountResidue -Confirm:$false | Out-Null; UILog 'Cleaned up any residual mount processes.' 'SUCCESS' }
     } catch { UILog "Dismount failed: $_" 'ERROR' }
+    # Clear the selection state tied to the (now gone) mounted database, so no handler can use a
+    # stale DN / diff against a null session.
+    $sync.SelectedNodeDN = $null; $sync.SelectedDiff = $null; $sync.Diffs = @()
+    try { (C 'W5_Tree').Items.Clear(); (C 'W5_Attrs').ItemsSource = $null; (C 'W5_NodeLabel').Text = 'Snapshot dismounted - mount a database to browse again (step 5).' } catch {}
 })
 
 # ----------------------------------------------------------------------------

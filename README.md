@@ -11,6 +11,25 @@ part is retrieving the `ntds.dit` file from a backup.
 
 ---
 
+## Launch the tool
+
+Two ways to start it — **both run exactly the same tool**. Pick whichever your environment prefers:
+
+**① Double-click `HYCUADRecovery.exe`**
+A single self-contained file (everything is embedded). Copy it anywhere and run it — nothing else
+needed. The simplest option.
+
+**② Double-click `Run-HYCUADRecovery.cmd`**
+Starts the tool through the Windows PowerShell that ships with Windows. Use this if the `.exe` does
+not start on your workstation. This method needs the module files next to it — keep
+`Run-HYCUADRecovery.cmd` in the **same folder** as `HYCUADRecovery.psd1` / `.psm1`,
+`HYCUClient.psm1`, `HYCUSecrets.psm1` and `Start-HYCUADRecoveryGUI.ps1`.
+
+> Run it on a **domain member with the AD DS tools (RSAT / `dsamain`)** present — see
+> [Prerequisites](#2-prerequisites). Keep **Simulation mode (`-WhatIf`)** enabled for your first runs.
+
+---
+
 ## 1. How it works
 
 ```
@@ -79,10 +98,12 @@ Install-WindowsFeature RSAT-AD-Tools, RSAT-AD-PowerShell
 
 | File | Role |
 |---|---|
+| `HYCUADRecovery.exe` | **Standalone launcher** — double-click to run (self-contained). |
+| `Run-HYCUADRecovery.cmd` | **Alternative launcher** — starts the tool via Windows PowerShell. |
 | `HYCUADRecovery.psd1` | **Module manifest** (v2.0.0) — import this one. |
 | `HYCUADRecovery.psm1` | AD PowerShell engine (mount, compare, restore). |
 | `HYCUClient.psm1` | **HYCU REST client** (connect, VMs, restore points, file-level restore). |
-| `HYCUSecrets.psm1` | **Connection profiles & secrets**, DPAPI-encrypted. |
+| `HYCUSecrets.psm1` | **Connection profiles** — save and reuse connection settings. |
 | `Start-HYCUADRecoveryGUI.ps1` | WPF interface: **guided wizard + dashboard**. |
 | `Examples.ps1` | Command-line usage examples (full walkthrough). |
 | `Tests/` | Pester tests (`Invoke-Pester .\Tests`). |
@@ -165,21 +186,26 @@ by another user or on another machine, never written in clear text.
 
 ## 5. Usage
 
-### Graphical interface
+To start the tool, see [Launch the tool](#launch-the-tool) at the top of this README (the standalone
+`.exe` or `Run-HYCUADRecovery.cmd`). You can also run the GUI script directly:
 ```powershell
 powershell -ExecutionPolicy Bypass -STA -File .\Start-HYCUADRecoveryGUI.ps1
 ```
+
 The interface has **two modes** (it stays responsive: long operations run in the background):
 
-**"Wizard" tab** — guided 6-step workflow:
+**"Wizard" tab** — guided 7-step workflow:
 1. **Connect to HYCU** (or "I already have an NTDS folder" to skip HYCU) — profiles can be saved.
 2. **AD controller + restore point** — list only the Active Directory domain controllers (HYCU
    `ACTIVE_DIRECTORY` applications) and their backups (app/crash consistency).
-3. **Retrieve NTDS** — one click: the tool mounts the backup in HYCU, copies the NTDS database
-   locally and unmounts. Fully automatic, no HYCU console needed.
-4. **Mount + compare** — `esentutl` → `dsamain` → LDAP diff against production (X deleted / Y modified).
-5. **Selection** — object grid + **attribute-by-attribute diff** + **cart**.
-6. **Restore** — simulation (`-WhatIf`) enabled by default, "remove added groups" option.
+3. **Restore destination** — the SMB share HYCU writes the file-level restore to (saved with the
+   connection profile).
+4. **Retrieve NTDS** — one click: the tool mounts the backup in HYCU, restores the files to the
+   destination share, copies the NTDS database locally and unmounts. Fully automatic, no HYCU
+   console needed.
+5. **Mount + compare** — `esentutl` → `dsamain` → LDAP diff against production (X deleted / Y modified).
+6. **Selection** — object tree + search + **List GPOs** + **attribute-by-attribute diff** + **cart**.
+7. **Restore** — simulation (`-WhatIf`) enabled by default, "remove added groups" option.
 
 **"Advanced / Dashboard" tab** — everything on one screen for expert operators: mount, compare,
 grids, cart, LDIF export, restore selection/cart, dismount.

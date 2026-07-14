@@ -572,6 +572,31 @@ Describe 'Compare-HYCUADObjects (GUID matching + classification)' {
         (@($r | Where-Object { $_.Status -eq 'Modified' }).Name) | Should Be 'a'
         (@($r | Where-Object { $_.Status -eq 'Modified' })[0].ChangedCount) | Should Be 1
     }
+
+    It 'handles objects with MULTIPLE changed attributes without throwing (breakdown diagnostic)' {
+        # Regression: the "Modified breakdown" diagnostic indexed a hashtable with $ad.Attribute; when an
+        # object had several changed attributes the wrapped AttributeDiffs array made $ad.Attribute an
+        # Object[], throwing "Index operation failed / Cannot convert Object[] to Int32" during a real
+        # mount+compare (single-attribute mocks had hidden it).
+        Mock -ModuleName HYCUADRecovery Get-LdapEntries {
+            @(
+                [pscustomobject]@{ objectGUID = ([guid]'cccccccc-0000-0000-0000-000000000001').ToByteArray(); distinguishedName = 'CN=m,DC=corp,DC=local'; name = 'm'; objectClass = @('user'); description = 'old'; displayName = 'Old'; title = 'T1'; telephoneNumber = '111' }
+            )
+        } -ParameterFilter { $Server -eq 'snaphost' }
+        Mock -ModuleName HYCUADRecovery Get-LdapEntries {
+            @(
+                [pscustomobject]@{ objectGUID = ([guid]'cccccccc-0000-0000-0000-000000000001').ToByteArray(); distinguishedName = 'CN=m,DC=corp,DC=local'; name = 'm'; objectClass = @('user'); description = 'new'; displayName = 'New'; title = 'T2'; telephoneNumber = '999' }
+            )
+        } -ParameterFilter { $Server -eq 'livehost' }
+        $r = @(Compare-HYCUADObjects -Session $session -LiveServer 'livehost' -Include All)
+        $m = @($r | Where-Object { $_.Status -eq 'Modified' })
+        $m.Count | Should Be 1
+        # All four changed attributes must be counted (the wrapped-array bug reported only 1)...
+        $m[0].ChangedCount | Should Be 4
+        # ...and the diff list must be a flat set of attribute objects, not a nested array.
+        @($m[0].AttributeDiffs).Count | Should Be 4
+        (@($m[0].AttributeDiffs | ForEach-Object { $_.Attribute } | Sort-Object) -join ',') | Should Be 'description,displayName,telephoneNumber,title'
+    }
 }
 
 Describe 'Module manifest' {
@@ -604,7 +629,14 @@ Describe 'HYCU profiles (DPAPI save / get / remove round-trip)' {
         (@(Get-HYCUADProfile) -contains 'ut') | Should Be $false
     }
     It 'refuses to save a profile with an empty token' {
-        { Save-HYCUADProfile -Name 'empty' -Server 's' -ApiToken (New-Object System.Security.SecureString) } | Should Throw
+        # Explicit try/catch instead of `| Should Throw`: Pester 3.4's Should Throw misses the
+        # exception when run under PowerShell 7 (it predates PS Core), which made this test fail
+        # there while the function behaves correctly. This pattern asserts on both runtimes.
+        $threw = $false; $msg = ''
+        try { Save-HYCUADProfile -Name 'empty' -Server 's' -ApiToken (New-Object System.Security.SecureString) }
+        catch { $threw = $true; $msg = $_.Exception.Message }
+        $threw | Should Be $true
+        $msg   | Should Match 'No API token'
     }
 }
 

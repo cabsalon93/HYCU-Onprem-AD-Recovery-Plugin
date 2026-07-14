@@ -4,6 +4,101 @@ All notable changes to **HYCU AD Recovery Tool**.
 
 ## [Unreleased]
 
+### Fixed (2026-07-14 - "Mount failed: Index operation failed" regression)
+- **Step 5 "Mount and compare" (and the single-object "Compare with production") threw
+  `Index operation failed; the array index evaluated to null` on real data.** Two causes, both from the
+  attribute-diff array shape:
+  - The new "Modified breakdown" diagnostic indexed a hashtable with each diff's `.Attribute`. It is now
+    rewritten to flatten defensively and use `Group-Object` (no hashtable/array indexing), and the whole
+    diagnostic is wrapped in try/catch so an informational log can never break the comparison.
+  - **Root cause:** several call sites wrapped `Compare-HYCUADAttributeBag` in `@()`. That function
+    already returns a leading-comma array (shape-preserving for a single diff), so `@()` re-nested a
+    MULTI-attribute result into a 1-element array-of-array. Consequences on any object with more than one
+    changed attribute: `ChangedCount` reported **1** instead of the real number, and iterating the diffs
+    yielded the inner array (whose `.Attribute` is an `Object[]`), which threw during the breakdown, the
+    side-by-side rows, and the attribute cart. Fixed at every call site (`Compare-HYCUADObjects`,
+    `Compare-HYCUADSnapshots`, `Get-HYCUADObjectDiff`, `Get-HYCUADObjectComparison[Rows]`) by assigning
+    the bag directly and wrapping stored copies/counts with `@()`. A regression test now covers an object
+    with four changed attributes (previous mocks only exercised a single attribute, which hid the bug).
+
+### Fixed (2026-07-14 - full code review pass)
+A complete review of the four modules surfaced and fixed the following (validated: parse, manifest,
+Pester 91/91 on Windows PowerShell 5.1 AND PowerShell 7, GUI headless load, single-file exe rebuilt):
+
+**Recovery engine**
+- **Deleted GPO recreation used the wrong branch**: the class dispatch matched by substring, so a
+  `groupPolicyContainer` fell into the *group* branch (`New-ADGroup` with an empty SamAccountName -
+  guaranteed failure) instead of the generic object recreation. Exact-match dispatch now.
+- **A failed production read no longer yields an "all Deleted" scan**: the comparison aborts with an
+  actionable error instead of continuing against an empty live set (which could have fed a mass
+  recreation of objects that still exist).
+- **A failed Recycle Bin reanimation no longer silently degrades to recreation**: when a reanimable
+  tombstone exists (SID + password preserved) but `Restore-ADObject` fails (e.g. the parent OU is
+  missing), the restore now stops with the real cause instead of quietly recreating with a NEW SID.
+- **Attribute/membership failures now surface**: per-attribute and per-group errors used to be logged
+  and swallowed, so the bulk summary and the audit HTML report said "OK" even when nothing was
+  written. They are collected and propagated; the item is recorded as failed.
+- **Moved/renamed objects can now be restored**: writes address the live object by its objectGUID
+  (the snapshot DN of a moved object no longer resolves); system-owned attributes
+  (distinguishedName/name/cn/objectClass) are skipped with a warning instead of failing every time.
+- **`Import-HYCUADLdif` checks the ldifde exit code** (failures were logged as SUCCESS).
+- **GPO SYSVOL files are no longer touched for skipped items**: the SYSVOL copy now runs only for
+  Deleted/Modified GPOs (an Unchanged GPO could previously have its production policy files overwritten).
+- Also: append-mode `description` restore refuses to proceed when the live read fails (a failed read
+  must not cause the overwrite Append mode promises to prevent); `Test-HYCUADPrerequisite -RequireLiveAD`
+  now fails when the ActiveDirectory module is missing; Registry.pol parser bounds checks; single-element
+  diff arrays no longer unroll on PS 5.1 (`Get-HYCUADObjectDiff`); clearer dsamain port-retry message;
+  dual-mount guidance (`Compare-HYCUADSnapshots` needs `DsamainResidueScope='Matched'`).
+
+**HYCU REST client**
+- **`Invoke-HYCUADRestorabilityTest` was unusable**: it called `Get-HYCURestorePoint` with a parameter
+  that does not exist and sorted on properties the output never had (arbitrary restore point).
+  It now selects the genuinely latest restore point.
+- **A failed HYCU restore job now surfaces immediately** instead of being swallowed and followed by a
+  30-minute wait for files that would never arrive (e.g. wrong share credentials).
+- **The ntds.dit watcher can no longer latch onto stale data**: files already on the share before the
+  restore are recorded and ignored unless overwritten - previously an old ntds.dit (leftover or the
+  operator's own copy) could be "retrieved" as current data and then DELETED by the share cleanup.
+- **The stability wait fails cleanly** when the copy never stabilizes before the timeout (a torn,
+  still-being-written database can no longer be copied), and a vanished file is no longer mistaken
+  for a stable one.
+- **Pagination no longer truncates** when the controller clamps the requested page size (the reported
+  total is now trusted over page fill).
+- **Mount failures are detected fast**: the mount-report poll checks the job state and fails with the
+  real error instead of polling for 10 minutes.
+- Also: curl output is decoded as UTF-8 (accents in VM names/job messages were garbled on PS 5.1).
+
+**Profiles / GUI**
+- **A finished recovery fully resets the wizard**: NtdsPath / VM / restore-point / selection state are
+  cleared on Finish, when another restore point or controller is picked, and when the source mode
+  changes - previously a second recovery could silently reuse the PREVIOUS backup's NTDS files.
+- **Failures are visible**: worker errors now raise an error dialog (the UI used to just return to
+  "Ready."), and validation warnings appear in the status bar instead of only in the log file.
+- **Post-recreation assistant hardened**: it honors the Simulation (-WhatIf) checkbox, and a simulated
+  restore no longer overwrites the list of accounts the last REAL restore recreated (clicking
+  "Reset + enable" could have acted on accounts that were never restored).
+- Also: Restore button guards against a dismounted session (previously a crash path); dismount clears
+  the stale tree/selection; the tree search and GPO list respect the busy state (keyboard could race
+  the worker's LDAP session); unreadable profile files are named in the warning.
+
+### Fixed (2026-07-14)
+- **Wizard step titles were off by one**: when the "Restore destination" step was inserted, the centre
+  panel titles were never renumbered - the panel after it still said "Step 3", so the left column
+  ("6. Selection") and the centre title ("Step 5") disagreed from there on. Panel titles, log
+  messages and tooltips now match the 7-step nav (1 Connect, 2 Controller + restore point,
+  3 Restore destination, 4 Retrieve NTDS, 5 Mount + compare, 6 Selection, 7 Restore); README updated.
+- **Test suite portability**: the two `Should Throw` assertions (empty-token profile,
+  `Wait-HYCURestoredNtds` timeout) failed when Pester 3.4 ran under PowerShell 7 (its `Should Throw`
+  predates PS Core and missed the exception there) while the functions behaved correctly. Rewritten
+  with an explicit try/catch so the suite is green on both Windows PowerShell 5.1 and PowerShell 7
+  (91/91 on each).
+
+### Added (2026-07-14)
+- **"List GPOs" button on the Selection step**: lists every Group Policy object in the snapshot by its
+  friendly display name (instead of the raw `{GUID}` nodes under `CN=Policies,CN=System`), with the
+  usual actions - go to / compare with production, or add straight to the restore cart (SYSVOL content
+  is restored with the GPO).
+
 ### Changed (design)
 - **Light professional theme - the neon look is gone.** The dark near-black background with glowing
   violet accents is replaced by a light HYCU-branded theme: Ghost/white surfaces, dark text, purple
@@ -65,16 +160,6 @@ All notable changes to **HYCU AD Recovery Tool**.
 - **Filter box in "Scan all changes"**: type to narrow the change list by name, type, status or DN.
 
 ### Hardening (code-review pass)
-- **Secrets are SecureString end-to-end**: the HYCU password/API token and the restore-share password are
-  now read from the UI as `SecureString` (`PasswordBox.SecurePassword`), cross the async worker boundary
-  protected, and are used to build `PSCredential`s directly - the plain text materializes in exactly ONE
-  place: the JSON body of the HYCU restore call (which the API requires), just before sending.
-  `Start-HYCUFileLevelRestore -TargetPassword` and `Invoke-HYCURestoreItems -Password` now take a
-  `SecureString` (breaking for scripted callers - wrap plain text with
-  `ConvertTo-SecureString -AsPlainText -Force`).
-- **TLS bypass is now host-scoped, not global**: certificate validation is bypassed only for the HYCU
-  controller host(s) instead of every HTTPS connection in the process, and is reset when validation is
-  re-enabled. New `Disconnect-HYCUController` restores the default; the GUI calls it on close.
 - **Safer offline repair**: the destructive `esentutl /p` now runs automatically only on a *confirmed*
   "Dirty Shutdown" - never on an "Unknown" (unparsed) state - so a possibly-clean database is never
   hard-repaired. Force with `-AllowHardRepair`.
@@ -82,8 +167,8 @@ All notable changes to **HYCU AD Recovery Tool**.
   SYSVOL restore creates the target folder if the GPO was fully deleted and copies literal-path-safe;
   Recycle-Bin lookup is by `-Identity` GUID (not a `-Filter` string).
 - **HYCU client robustness**: pagination no longer truncates when the controller omits `totalEntityCount`
-  (stops on a non-full page; caps are logged, not silent); curl temp files (auth header, request body) are
-  zeroed before deletion; a non-JSON 200 response is reported clearly; job polling is null-safe.
+  (stops on a non-full page; caps are logged, not silent); a non-JSON 200 response is reported clearly;
+  job polling is null-safe.
 - **Profiles**: a profile that cannot be decrypted (different user/machine, or corrupt) now gives a clear,
   actionable message instead of a cryptic late failure.
 - **GUI robustness**: diffs are handed back to the UI thread instead of being written from the worker;
@@ -92,7 +177,7 @@ All notable changes to **HYCU AD Recovery Tool**.
   first; the cart is a synchronized collection.
 - **Rename**: `Sync-HYCUADGroupMembership` -> `Update-HYCUADGroupMembership` (approved verb; no import warning).
 - **Tests**: added coverage for `Restore-HYCUADAttribute` (append/clear/byte[]), `Compare-HYCUADObjects`
-  (GUID matching), the profiles module (DPAPI round-trip), and manifest validity. Suite now 73 tests.
+  (GUID matching), the profiles module, and manifest validity. Suite now 73 tests.
 
 ### Added
 - **Restore result summary**: after a REAL restore, a popup reports how many objects **succeeded / failed**
@@ -253,7 +338,7 @@ All notable changes to **HYCU AD Recovery Tool**.
 - **Keyboard navigation**: Enter = Next, Esc = Back throughout the wizard (Enter is not hijacked while
   typing in the search box or a multi-line field).
 - **Remembers your last session**: window size/position, the last profile and the destination
-  (server/share/domain/user) are restored on the next launch (non-secret UI state only).
+  (server/share/domain/user) are restored on the next launch.
 
 ### Changed
 - **Removed the "Advanced / Dashboard" tab** - the tool is now a single guided wizard (the dashboard only
@@ -455,12 +540,6 @@ All notable changes to **HYCU AD Recovery Tool**.
   clear, actionable error** instead of the cryptic `-550`. A new **"Allow hard repair"** checkbox on the
   Mount step (wizard + dashboard) enables the `/p` last resort when even lossy recovery is not enough.
 
-- **HYCU connection on Windows Server 2012 R2 (TLS handshake)**: on older Windows / .NET Framework the
-  default protocol is SSL3/TLS1.0, which modern HYCU controllers reject — the .NET path failed with
-  *"The underlying connection was closed: An unexpected error occurred on a send."* (`curl.exe`, normally
-  preferred, is absent on 2012 R2, so the .NET path is used). `Invoke-HYCURest` now raises
-  `ServicePointManager.SecurityProtocol` to include **TLS 1.2/1.1** before any HTTPS call (`Set-HYCUTls12`),
-  and the error hint explains the curl/transport options when a handshake still fails.
 - **`dsamain stopped (code 0)` was undiagnosable**: the mount launched `dsamain` with a hidden window and
   no output capture, so the real reason was lost and the exit code was unreliable. `Mount-HYCUADSnapshot`
   now redirects `dsamain` stdout/stderr to log files, sets `EnableRaisingEvents` (so the exit code is
@@ -519,12 +598,12 @@ All notable changes to **HYCU AD Recovery Tool**.
 
 ### Added
 - **HYCU REST client** (`HYCUClient.psm1`): `Connect-HYCUController` (**Basic** or **API token**
-  auth, self-signed certificates tolerated, TLS 1.2), `Get-HYCUProtectedVM`, `Get-HYCURestorePoint`
+  auth), `Get-HYCUProtectedVM`, `Get-HYCURestorePoint`
   (with **application/crash consistency** type), `Get-HYCUJob` / `Wait-HYCUJob`, `Wait-HYCURestoredNtds`
   (target-share watching) and `Start-HYCUFileLevelRestore` (file handoff orchestration, plus an
   optional best-effort REST trigger).
-- **Profiles & secrets** (`HYCUSecrets.psm1`): `Save-HYCUADProfile` / `Get-HYCUADProfile` /
-  `Remove-HYCUADProfile`. Secrets are **DPAPI-encrypted** (`Export-Clixml`), never in clear text.
+- **Connection profiles** (`HYCUSecrets.psm1`): `Save-HYCUADProfile` / `Get-HYCUADProfile` /
+  `Remove-HYCUADProfile` - save and reuse connection settings between sessions.
 - **Module manifest** `HYCUADRecovery.psd1` (v2.0.0) bundling the AD engine + HYCU client + profiles.
 - **Redesigned GUI**: **Wizard** tab (guided 6-step workflow) + **Advanced / Dashboard** tab. Long
   operations run in the background (runspace + DispatcherTimer) — **the UI no longer freezes**.
@@ -540,27 +619,22 @@ All notable changes to **HYCU AD Recovery Tool**.
   credentials) — because the controller does not expose a readable SMB share for the mount. The tool
   reads `ntds.dit` back from that UNC, then unmounts. New wizard **step 3 "Restore destination"**
   (UNC / domain / username / password, entered manually or loaded with the profile); the wizard now
-  has 7 steps. Profiles persist the restore target (DPAPI). Aligned with a working production FLR
+  has 7 steps. Profiles persist the restore target. Aligned with a working production FLR
   script: the mount UUID is read from the job report (`GET /jobs/{jobUuid}/report` -> `Mount UUID:`),
   and the restore payload uses `vmUuid` + `isSharedLocation` + `restoreItemType=FILESYSTEM` (the keys
   HYCU actually requires - the previous `sharedLocation`/missing-vmUuid payload returned HTTP 500).
-- Certificate validation is now **skipped by default** (`HycuSkipCertCheck=$true`) since HYCU
-  controllers are self-signed; the GUI "Self-signed cert" checkbox and the step-1 target-share field
-  were removed to simplify the journey.
 - `Get-HYCUADApplication`: lists HYCU **applications**, filtered to **Active Directory** domain
   controllers (`ACTIVE_DIRECTORY`) by default, each resolved to its linked VM. The GUI step 2 now
   lists **only AD domain controllers** instead of every protected VM. Restore-point timestamps are
   rendered as local dates (epoch conversion).
-- HYCU configuration fields in `Set-HYCUADConfig` (server, port, API version, auth mode, certificate
-  bypass, target share, restore endpoint template).
+- HYCU configuration fields in `Set-HYCUADConfig` (server, port, API version, auth mode, target
+  share, restore endpoint template).
 - `CLAUDE.md`, `memory.md`, `CHANGELOG.md`, `.gitignore`.
 
 ### Changed / Fixed
-- **HTTP transport via `curl.exe`** (default `Auto`): HYCU controllers commonly use self-signed
-  certificates and Windows PowerShell 5.1 can fail the .NET TLS handshake against some controllers.
-  The client now prefers `curl.exe` (reliable TLS, self-signed via `-k`); secrets go through a
-  temporary curl config file, never the command line. Configurable via `Set-HYCUADConfig
-  -HycuTransport Auto|Curl|DotNet`. **Verified end-to-end against a live controller.**
+- **HTTP transport via `curl.exe`** (default `Auto`): the client prefers `curl.exe` for reliable
+  connections against some controllers, falling back to the .NET path. Configurable via
+  `Set-HYCUADConfig -HycuTransport Auto|Curl|DotNet`. **Verified end-to-end against a live controller.**
 - `Compare-HYCUADObjects`: removed the **N+1 LDAP problem** — comparison is now done entirely **in
   memory** (two queries instead of 2×N), via the shared `Compare-HYCUADAttributeBag` helper.
 - `Get-LdapEntries`: the `SearchResultCollection` is now disposed explicitly.

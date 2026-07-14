@@ -186,7 +186,12 @@ function Connect-HYCUController {
                 if (-not $script:HYCUBypassHosts) {
                     $script:HYCUBypassHosts = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
                 }
-                [void]$script:HYCUBypassHosts.Add([string]$Server)
+                # Key the bypass on the ACTUAL host: with only -BaseUrl supplied, $Server is empty and
+                # an '' entry would never match the callback's host check - the connection would fail
+                # with a certificate error even though skip is on.
+                $bypassHost = $Server
+                if (-not $bypassHost) { try { $bypassHost = ([uri]$BaseUrl).Host } catch {} }
+                if ($bypassHost) { [void]$script:HYCUBypassHosts.Add([string]$bypassHost) }
                 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
                     param($sender, $certificate, $chain, $sslPolicyErrors)
                     if ($sslPolicyErrors -eq [System.Net.Security.SslPolicyErrors]::None) { return $true }
@@ -202,7 +207,8 @@ function Connect-HYCUController {
                 Write-HYCUClientLog "Certificate validation bypassed for the HYCU host(s) only: $($script:HYCUBypassHosts -join ', ')." 'WARN'
             } catch { Write-HYCUClientLog "Could not configure TLS bypass: $_" 'WARN' }
         } else {
-            try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null } catch {}
+            # Also clear the recorded hosts so the state matches the (now removed) callback.
+            try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null; $script:HYCUBypassHosts = $null } catch {}
         }
     }
 
@@ -379,8 +385,18 @@ function Invoke-HYCURestViaCurl {
         # would read as part of the first option (e.g. unknown option 'url').
         [IO.File]::WriteAllText($cfg, [string]::Join("`n", $lines), (New-Object System.Text.UTF8Encoding($false)))
 
-        $text = (& $CurlPath --config $cfg 2>&1 | Out-String)
-        $exit = $LASTEXITCODE
+        # curl emits UTF-8, but PS 5.1 decodes native stdout with the console OEM codepage
+        # (CP850/CP437) - accents in VM names / job messages would be mojibake'd. Force UTF-8 for
+        # the read and restore afterwards. Guarded: with no attached console (ps2exe -noConsole)
+        # the property can throw - then we just proceed with the default decoding.
+        $prevEnc = $null
+        try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+        try {
+            $text = (& $CurlPath --config $cfg 2>&1 | Out-String)
+            $exit = $LASTEXITCODE
+        } finally {
+            if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch {} }
+        }
         if ($exit -ne 0) {
             if ($exit -eq 60) {
                 throw "TLS certificate not trusted - the HYCU controller likely uses a self-signed certificate. Enable 'Self-signed cert' in the connection settings (or run Set-HYCUADConfig -HycuSkipCertCheck `$true), then retry."
@@ -457,10 +473,13 @@ function Get-HYCUAllPages {
             $total = [int]$resp.metadata.totalEntityCount
         }
         $page++
-        # Stop on a NON-FULL page (natural end - works even when the controller omits totalEntityCount,
-        # which the old code got wrong: it truncated after page 1), or once the reported total is reached.
-        if ($entities.Count -lt $PageSize) { break }
-        if ($null -ne $total -and $all.Count -ge $total) { break }
+        # An empty page always ends the loop (defensive: avoids spinning to MaxPages on a bad total).
+        if ($entities.Count -eq 0) { break }
+        # When the controller reports totalEntityCount, trust IT rather than the page fill: a server
+        # that clamps the requested pageSize (e.g. caps 1000 at 100) returns "non-full" pages that
+        # still have successors - breaking on fill alone silently truncated such listings.
+        if ($null -ne $total) { if ($all.Count -ge $total) { break } }
+        elseif ($entities.Count -lt $PageSize) { break }   # no total reported: non-full page = natural end
     }
     if ($page -gt $MaxPages) { Write-HYCUClientLog "Pagination hit the $MaxPages-page cap for '$Path' ($($all.Count) item(s)); there may be more results." 'WARN' }
 
@@ -652,6 +671,12 @@ function Wait-HYCURestoredNtds {
         [int]$TimeoutSeconds = 1800,
         [int]$StableSeconds = 10,
         [int]$PollSeconds = 5,
+        # Snapshot of ntds.dit files that were ALREADY on the share before the restore started
+        # (path -> "lastWriteTicks:length"). A hit on one of these paths is accepted only once the
+        # file actually changed - otherwise the watcher would latch onto stale leftovers from an
+        # earlier run (or an operator's own copy), return old data as "restored", and the share
+        # cleanup would then delete it.
+        [hashtable]$IgnoreExisting,
         [scriptblock]$OnProgress
     )
     $report = {
@@ -664,8 +689,14 @@ function Wait-HYCURestoredNtds {
     $dit = $null
     while ((Get-Date) -lt $deadline) {
         if (Test-Path $Path) {
-            $dit = Get-ChildItem -Path $Path -Filter 'ntds.dit' -File -Recurse -ErrorAction SilentlyContinue |
-                   Select-Object -First 1
+            $cands = @(Get-ChildItem -Path $Path -Filter 'ntds.dit' -File -Recurse -ErrorAction SilentlyContinue)
+            foreach ($c in $cands) {
+                if ($IgnoreExisting -and $IgnoreExisting.ContainsKey($c.FullName)) {
+                    $sig = '{0}:{1}' -f $c.LastWriteTimeUtc.Ticks, $c.Length
+                    if ($sig -eq $IgnoreExisting[$c.FullName]) { continue }   # untouched pre-existing copy: not ours
+                }
+                $dit = $c; break
+            }
             if ($dit) { break }
         }
         Start-Sleep -Seconds $PollSeconds
@@ -673,19 +704,26 @@ function Wait-HYCURestoredNtds {
     if (-not $dit) { throw "ntds.dit did not appear in '$Path' before the timeout ($TimeoutSeconds s)." }
 
     & $report "ntds.dit found: $($dit.FullName). Waiting for the copy to stabilize..."
-    # Stability wait: ntds.dit size must stop changing for StableSeconds.
-    $lastSize = -1; $stableSince = $null
+    # Stability wait: ntds.dit size must stop changing for StableSeconds. Reaching the deadline
+    # without stability is an ERROR (the file is still being written - copying it would yield a
+    # torn database), not a silent fall-through.
+    $lastSize = -1; $stableSince = $null; $stable = $false
     while ((Get-Date) -lt $deadline) {
         $cur = (Get-Item $dit.FullName -ErrorAction SilentlyContinue).Length
-        if ($cur -eq $lastSize) {
+        if ($null -eq $cur) {
+            # The file vanished (replaced/renamed mid-restore): reset and keep watching. Without this,
+            # two consecutive $null reads compared equal and a nonexistent file passed as "stable".
+            $lastSize = -1; $stableSince = $null
+        } elseif ($cur -eq $lastSize) {
             if (-not $stableSince) { $stableSince = Get-Date }
-            elseif (((Get-Date) - $stableSince).TotalSeconds -ge $StableSeconds) { break }
+            elseif (((Get-Date) - $stableSince).TotalSeconds -ge $StableSeconds) { $stable = $true; break }
         } else {
             $lastSize = $cur; $stableSince = $null
             & $report ("Copying... ntds.dit = {0} MB" -f [math]::Round($cur/1MB,1))
         }
         Start-Sleep -Seconds ([Math]::Max(1, [Math]::Min($PollSeconds, $StableSeconds)))
     }
+    if (-not $stable) { throw "ntds.dit did not stabilize in '$Path' before the timeout ($TimeoutSeconds s) - the restore may still be writing." }
 
     $folder = Split-Path $dit.FullName -Parent
     $logCount = @(Get-ChildItem -Path $folder -Filter 'edb*.log' -File -ErrorAction SilentlyContinue).Count
@@ -750,7 +788,17 @@ function Mount-HYCUBackup {
                 & $report "Mount ready (mountUuid $mu)."
                 return [pscustomobject]@{ MountUuid = $mu; JobUuid = $jobUuid; Raw = $rep }
             }
-        } catch { $lastErr = "$_"; Write-HYCUClientLog "mount report poll: $_" 'DEBUG' }
+            # No mount UUID yet: fail fast if the mount job itself has failed, instead of polling
+            # the report for up to 10 minutes and throwing a generic message.
+            $mj = Get-HYCUJob -Session $Session -JobUuid $jobUuid
+            $st = ([string]$mj.Status).ToUpper()
+            if (@('ERROR','FAILED','ABORTED','CANCELED','CANCELLED') -contains $st) {
+                throw "HYCU mount job failed ($($mj.Status)): $($mj.Message)"
+            }
+        } catch {
+            if ("$_" -match 'mount job failed') { throw }
+            $lastErr = "$_"; Write-HYCUClientLog "mount report poll: $_" 'DEBUG'
+        }
     }
     throw ("Mount UUID not found in the job report in time." + $(if ($lastErr) { " Last error: $lastErr" }))
 }
@@ -831,7 +879,17 @@ function Invoke-HYCURestoreItems {
         $e0 = @($resp.entities)[0]
         $jobUuid = if ($e0 -is [string]) { $e0 } else { [string](Get-HYCUFirstProperty $e0 @('uuid','jobUuid','id')) }
     }
-    if ($jobUuid) { try { Wait-HYCUJob -Session $Session -JobUuid $jobUuid -TimeoutSeconds $TimeoutSeconds -OnProgress $OnProgress | Out-Null } catch { Write-HYCUClientLog "restore job wait: $_" 'DEBUG' } }
+    if ($jobUuid) {
+        try { Wait-HYCUJob -Session $Session -JobUuid $jobUuid -TimeoutSeconds $TimeoutSeconds -OnProgress $OnProgress | Out-Null }
+        catch {
+            # A DEFINITIVE job failure (ERROR/FAILED/ABORTED - e.g. the controller cannot write the
+            # target share) must surface now: swallowing it used to send the caller into a 30-minute
+            # wait for an ntds.dit that would never arrive. Polling glitches and a slow job that
+            # outlives the wait stay best-effort (the downstream file watcher still decides).
+            if ("$_" -match 'HYCU job failed') { throw }
+            Write-HYCUClientLog "restore job wait (non-fatal): $_" 'WARN'
+        }
+    }
     return $resp
 }
 
@@ -950,19 +1008,10 @@ function Start-HYCUFileLevelRestore {
         $items = @("$vol/Windows/NTDS")
         if ($IncludeSysvol) { $items += "$vol/Windows/SYSVOL" }
 
-        & $report "Restoring $($items -join ', ') to $TargetUnc (HYCU restore)..."
-        try {
-            Invoke-HYCURestoreItems -Session $Session -MountUuid $mount.MountUuid -SelectedItems $items `
-                -VmUuid $Vm.Uuid -TargetPath $TargetUnc -Domain $TargetDomain -Username $TargetUsername -Password $TargetPassword `
-                -TimeoutSeconds $TimeoutSeconds -OnProgress $OnProgress | Out-Null
-        } catch {
-            throw ("HYCU could not restore the files to '$TargetUnc'. The controller must be able to REACH and WRITE that share. Check: " +
-                   "(1) the server/share are correct and resolve from the HYCU controller's network, (2) the username/password" +
-                   "$(if ($TargetDomain) { " (domain $TargetDomain)" }) can write to it, (3) the share exists. Underlying error: $_")
-        }
-
-        # The restore is asynchronous: map the target share and wait for ntds.dit to land.
-        & $report "Restore started. Waiting for ntds.dit to appear on $TargetUnc ..."
+        # Map the target share FIRST: it validates the destination credentials early and lets us
+        # snapshot any ntds.dit already present, so the watcher below cannot latch onto stale data
+        # (leftovers of an earlier run whose cleanup failed, or the operator's own reference copy -
+        # which the share cleanup would then have DELETED after "retrieving" it).
         $cred = $null
         # Require BOTH: a username with an empty password would make the PSCredential constructor throw.
         # The SecureString is used as-is (never converted to a plain string here).
@@ -975,7 +1024,28 @@ function Start-HYCUFileLevelRestore {
         if ($cred) { $nd.Credential = $cred }
         New-PSDrive @nd | Out-Null
         try {
-            $srcNtds = Wait-HYCURestoredNtds -Path "${name}:\" -TimeoutSeconds $TimeoutSeconds -OnProgress $OnProgress
+            $pre = @{}
+            Get-ChildItem -Path "${name}:\" -Filter 'ntds.dit' -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                $pre[$_.FullName] = '{0}:{1}' -f $_.LastWriteTimeUtc.Ticks, $_.Length
+            }
+            if ($pre.Count -gt 0) {
+                & $report ("{0} pre-existing ntds.dit file(s) found on the share - ignored unless the restore overwrites them." -f $pre.Count)
+            }
+
+            & $report "Restoring $($items -join ', ') to $TargetUnc (HYCU restore)..."
+            try {
+                Invoke-HYCURestoreItems -Session $Session -MountUuid $mount.MountUuid -SelectedItems $items `
+                    -VmUuid $Vm.Uuid -TargetPath $TargetUnc -Domain $TargetDomain -Username $TargetUsername -Password $TargetPassword `
+                    -TimeoutSeconds $TimeoutSeconds -OnProgress $OnProgress | Out-Null
+            } catch {
+                throw ("HYCU could not restore the files to '$TargetUnc'. The controller must be able to REACH and WRITE that share. Check: " +
+                       "(1) the server/share are correct and resolve from the HYCU controller's network, (2) the username/password" +
+                       "$(if ($TargetDomain) { " (domain $TargetDomain)" }) can write to it, (3) the share exists. Underlying error: $_")
+            }
+
+            # The restore is asynchronous: wait for ntds.dit to land on the mapped share.
+            & $report "Restore started. Waiting for ntds.dit to appear on $TargetUnc ..."
+            $srcNtds = Wait-HYCURestoredNtds -Path "${name}:\" -TimeoutSeconds $TimeoutSeconds -IgnoreExisting $pre -OnProgress $OnProgress
             $dstNtds = Join-Path $DestinationPath 'NTDS'
             New-Item -ItemType Directory -Path $dstNtds -Force | Out-Null
             & $report "Copying the NTDS database + journals locally..."
@@ -1048,7 +1118,10 @@ function Invoke-HYCUADRestorabilityTest {
     }
     $vm = Get-HYCUProtectedVM -Session $Session -Name $VmName | Select-Object -First 1
     if (-not $vm) { throw "VM '$VmName' not found on the HYCU controller." }
-    $rp = Get-HYCURestorePoint -Session $Session -Vm $vm | Sort-Object -Property @{ Expression = { [string](Get-HYCUFirstProperty $_ @('RestorePointDate','Date','created')) } } -Descending | Select-Object -First 1
+    # -VmUuid (the function's identity parameter) and Timestamp (the property it actually emits):
+    # the previous call used a nonexistent -Vm parameter (bound to nothing -> hard failure) and
+    # sorted on properties that are not on the output objects (no-op sort -> arbitrary point).
+    $rp = Get-HYCURestorePoint -Session $Session -VmUuid $vm.Uuid | Sort-Object Timestamp -Descending | Select-Object -First 1
     if (-not $rp) { throw "No restore point found for VM '$VmName'." }
     Write-HYCUClientLog "Restorability test: VM $VmName, latest restore point selected." 'INFO'
     if (-not $PSCmdlet.ShouldProcess($VmName, "Retrieve the latest backup to $TargetUnc and verify it mounts")) { return }

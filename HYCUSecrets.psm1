@@ -124,8 +124,9 @@ function Get-HYCUADProfile {
         # drop nameless/null entries.
         return @(Get-ChildItem -Path $dir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
                  ForEach-Object {
-                     try { ($_ | Import-Clixml).Name }
-                     catch { Write-HYCUProfileLog "Skipping unreadable profile file: $($_.FullName) - $($_.Exception.Message)" 'WARN'; $null }
+                     $pf = $_   # inside catch, $_ is the ErrorRecord - capture the file first or FullName logs empty
+                     try { ($pf | Import-Clixml).Name }
+                     catch { Write-HYCUProfileLog "Skipping unreadable profile file: $($pf.FullName) - $($_.Exception.Message)" 'WARN'; $null }
                  } | Where-Object { $_ })
     }
     $file = Join-Path $dir ("{0}.xml" -f ($Name -replace '[\\/:*?"<>|]','_'))
@@ -145,7 +146,12 @@ function Get-HYCUADProfile {
         Port       = $prof.Port
         ApiVersion = $prof.ApiVersion
     }
-    if ($prof.SkipCertCheck) { $p['SkipCertificateCheck'] = $true }
+    # Pass the saved value EXPLICITLY (both $true and $false): forwarding only $true meant a profile
+    # deliberately saved with validation ON still fell back to the config default (skip) - a silent
+    # security-posture downgrade. Legacy profiles without the property keep the config default.
+    if ($prof.PSObject.Properties['SkipCertCheck'] -and $null -ne $prof.SkipCertCheck) {
+        $p['SkipCertificateCheck'] = [bool]$prof.SkipCertCheck
+    }
     if ($prof.AuthMode -eq 'Token') {
         $p['AuthMode']    = 'Token'
         $p['ApiToken']    = $prof.ApiToken

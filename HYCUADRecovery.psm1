@@ -200,10 +200,13 @@ function Test-HYCUADPrerequisite {
         }
     }
 
-    # ActiveDirectory module (used for production writes: Recycle Bin, Set-AD..., groups)
+    # ActiveDirectory module (used for production writes: Recycle Bin, Set-AD..., groups).
+    # When the caller REQUIRES it, its absence is a failure - a WARN-and-return-$true only
+    # postponed the error to the first Import-Module ... -ErrorAction Stop during a restore.
     if ($RequireLiveAD) {
         if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-            Write-HYCULog "ActiveDirectory PowerShell module missing (RSAT-AD-PowerShell)." 'WARN'
+            Write-HYCULog "ActiveDirectory PowerShell module missing (RSAT-AD-PowerShell) - required for production writes." 'ERROR'
+            $ok = $false
         } else {
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue
         }
@@ -731,7 +734,7 @@ function Mount-HYCUADSnapshot {
             $Port++
         }
     }
-    throw ("dsamain could not be started after $($Port - $requestedPort) port attempt(s) from $requestedPort. Last error:`n$lastErr")
+    throw ("dsamain could not be started after trying port(s) $requestedPort..$Port. Last error:`n$lastErr")
 }
 
 function Invoke-HYCUADdsamainMount {
@@ -961,10 +964,12 @@ function Stop-HYCUADMountResidue {
         }
     }
 
-    # 4. Default ('All'): stop EVERY remaining dsamain.exe. Safe because dsamain.exe is exclusively this
-    #    tool's mount process (a live DC runs as lsass/NTDS, never dsamain.exe). This guarantees a previous
-    #    session's leftover cannot keep the default port bound, so the tool reuses 41389 next time instead
-    #    of drifting up. Set DsamainResidueScope='Matched' to keep an unrelated concurrent dsamain alive.
+    # 4. Default ('All'): stop EVERY remaining dsamain.exe (a live DC runs as lsass/NTDS, never
+    #    dsamain.exe - but an ADMIN may run dsamain manually, e.g. to browse a VSS snapshot). This
+    #    guarantees a previous session's leftover cannot keep the default port bound, so the tool
+    #    reuses 41389 next time instead of drifting up. Set DsamainResidueScope='Matched' to keep any
+    #    other dsamain alive - REQUIRED for dual-mount scenarios (Compare-HYCUADSnapshots) and when
+    #    an operator's own dsamain must survive.
     if ($script:HYCUADConfig.DsamainResidueScope -ne 'Matched') {
         foreach ($p in @(Get-Process -Name dsamain -ErrorAction SilentlyContinue)) {
             if ($killed.Contains([int]$p.Id)) { continue }
@@ -1047,6 +1052,13 @@ function Get-LdapEntries {
     $searcher.Filter   = $Filter
     $searcher.PageSize = 1000
     $searcher.SearchScope = $Scope
+    # Read nTSecurityDescriptor with a FIXED portion set (Owner+Group+DACL, no SACL). Left at the default,
+    # the server returns the SACL only when the caller holds SeSecurityPrivilege - which is typically true
+    # for the offline mounted snapshot (opened by the local admin running dsamain) but false against the
+    # live DC. That asymmetry made the security-descriptor bytes differ on EVERY object, so the scan
+    # reported the whole directory as "Modified". Forcing the same mask on both reads makes the descriptor
+    # comparison apples-to-apples. SACL changes are out of scope for object recovery.
+    $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]'Owner, Group, Dacl'
     if ($Properties) {
         $Properties | ForEach-Object { [void]$searcher.PropertiesToLoad.Add($_) }
     } else {
@@ -1087,7 +1099,13 @@ function Get-LdapEntries {
 # ----------------------------------------------------------------------------
 $script:HYCUADDiffIgnore = @('whenChanged','uSNChanged','dSCorePropagationData','lastLogon',
     'lastLogonTimestamp','badPasswordTime','badPwdCount','logonCount','replPropertyMetaData',
-    'objectGUID','uSNCreated','adspath')
+    'objectGUID','uSNCreated','adspath',
+    # nTSecurityDescriptor: the security descriptor's bytes differ systematically between the offline
+    # mounted snapshot and the live DC (inherited-ACE ordering / SD revision), so it flagged virtually
+    # EVERY object as Modified even where nothing was changed. Restoring an object's ACL from a backup is
+    # out of scope for this tool (and can be harmful), so it is excluded from the comparison. Its cousins
+    # (sDRightsEffective/msDS-* effective-rights) are constructed and never returned by the bulk read.
+    'nTSecurityDescriptor')
 
 function ConvertTo-HYCUCanonicalValue {
     # Canonical, order-insensitive string for comparing an attribute value. A byte[] is rendered as
@@ -1171,7 +1189,13 @@ function Compare-HYCUADObjects {
     $snap = @(Get-LdapEntries -Server $Session.Server -BaseDN $base -Filter $LdapFilter)
     $live = @()
     try { $live = @(Get-LdapEntries -Server $LiveServer -BaseDN $base -Filter $LdapFilter -Credential $LiveCredential) }
-    catch { Write-HYCULog "Could not read production ($LiveServer): $_" 'ERROR' }
+    catch {
+        # A FAILED production read must abort the scan: continuing with $live = @() classified every
+        # snapshot object as 'Deleted', and feeding that into a bulk restore (or a scheduled drift
+        # report) would mass-recreate objects that still exist.
+        Write-HYCULog "Could not read production ($LiveServer): $_" 'ERROR'
+        throw "The production read failed ($LiveServer) - the comparison was aborted (otherwise every object would wrongly show as Deleted). Check the live DC / network / credentials. Underlying error: $_"
+    }
     Write-HYCULog ("Read {0} snapshot object(s) and {1} production object(s) for the scan." -f $snap.Count, $live.Count)
     if ($snap.Count -eq 0) { Write-HYCULog "The snapshot returned 0 objects for filter '$LdapFilter' under $base - the scan cannot find changes." 'WARN' }
     if ($live.Count -eq 0) { Write-HYCULog "Production returned 0 objects - every snapshot object will be reported as Deleted; check the production DC / credentials / base ($base)." 'WARN' }
@@ -1198,8 +1222,13 @@ function Compare-HYCUADObjects {
             $attrDiffs = @()
         } else {
             # In-memory diff from the two already-loaded attribute bags (no LDAP query here).
-            $attrDiffs = @(Compare-HYCUADAttributeBag -Snapshot $s -Live $liveByGuid[$guid])
-            $status = if ($attrDiffs.Count -gt 0) { 'Modified' } else { 'Unchanged' }
+            # DIRECT assignment (NOT wrapped in @()): Compare-HYCUADAttributeBag already returns a
+            # leading-comma array that keeps its shape for a single diff; wrapping it in @() re-nests a
+            # MULTI-attribute result into a 1-element array-of-array, so $attrDiffs.Count became 1 (wrong
+            # ChangedCount) and iterating it yielded the inner array whose .Attribute is an Object[] -
+            # which broke the breakdown/rows with "Index operation failed / cannot convert Object[]".
+            $attrDiffs = Compare-HYCUADAttributeBag -Snapshot $s -Live $liveByGuid[$guid]
+            $status = if (@($attrDiffs).Count -gt 0) { 'Modified' } else { 'Unchanged' }
         }
 
         if ($Include -contains 'All' -or $Include -contains $status) {
@@ -1210,9 +1239,44 @@ function Compare-HYCUADObjects {
                 DistinguishedName= $dn
                 ObjectGUID       = $guid
                 Status           = $status
-                AttributeDiffs   = $attrDiffs
-                ChangedCount     = $attrDiffs.Count
+                AttributeDiffs   = @($attrDiffs)
+                ChangedCount     = @($attrDiffs).Count
             })
+        }
+    }
+    # Diagnostic: histogram of which attributes drive the "Modified" verdicts. A single attribute flagged
+    # on (nearly) every modified object is the tell-tale of a systematic false positive (e.g. a volatile
+    # or read-asymmetric attribute) rather than real changes - surface it in the log so it can be pinned
+    # down without live debugging.
+    # Guarded end-to-end: a purely informational breakdown must NEVER be able to break the comparison.
+    $modified = @($diffs | Where-Object { $_.Status -eq 'Modified' })
+    if ($modified.Count -gt 0) {
+        try {
+            # Flatten to a plain list of attribute-name strings. The nested @($ad) guards the case where
+            # an object's AttributeDiffs is itself a wrapped array (Compare-HYCUADAttributeBag returns a
+            # leading-comma array): without it, $ad becomes the inner array and $ad.Attribute an Object[].
+            $names = foreach ($m in $modified) {
+                foreach ($ad in @($m.AttributeDiffs)) {
+                    foreach ($one in @($ad)) {
+                        if ($one -and $one.PSObject.Properties['Attribute']) { [string]$one.Attribute }
+                    }
+                }
+            }
+            $names = @($names | Where-Object { $_ })
+            if ($names.Count -gt 0) {
+                # Group-Object (not a hashtable) avoids any null/array key indexing pitfalls entirely.
+                $top = $names | Group-Object | Sort-Object Count -Descending | Select-Object -First 8
+                $summary = ($top | ForEach-Object { "{0}={1}" -f $_.Name, $_.Count }) -join ', '
+                Write-HYCULog ("Modified breakdown ({0} object(s)) - attributes flagged (count): {1}" -f $modified.Count, $summary)
+                # Only meaningful on a real population: with a handful of modified objects a legitimate
+                # change would trivially hit the 95% bar and the warning would mislead.
+                $universal = @($top | Where-Object { $modified.Count -ge 10 -and $_.Count -ge [math]::Ceiling($modified.Count * 0.95) })
+                if ($universal.Count -gt 0) {
+                    Write-HYCULog ("Attribute(s) [{0}] changed on ~every modified object - this usually means a systematic/volatile difference, not a real edit. Consider adding them to the diff ignore list." -f (($universal | ForEach-Object { $_.Name }) -join ', ')) 'WARN'
+                }
+            }
+        } catch {
+            Write-HYCULog "Modified-breakdown diagnostic skipped ($_)." 'DEBUG'
         }
     }
     Write-HYCULog ("Comparison finished: {0} object(s) retained." -f $diffs.Count) 'SUCCESS'
@@ -1255,7 +1319,10 @@ function Compare-HYCUADSnapshots {
       Compares TWO mounted snapshots (e.g. two restore points) - "when did this change?".
     .DESCRIPTION
       Both sessions come from Connect-HYCUADSnapshot (each ntds.dit is mounted on its own dsamain
-      port). Objects are matched by objectGUID and classified from the REFERENCE (older) snapshot's
+      port). IMPORTANT: run Set-HYCUADConfig -DsamainResidueScope 'Matched' BEFORE mounting the
+      second snapshot - the default residue cleanup ('All') stops every dsamain.exe at each mount,
+      which would kill the first session's process.
+      Objects are matched by objectGUID and classified from the REFERENCE (older) snapshot's
       perspective: 'OnlyInReference' (existed then, gone in the difference snapshot), 'Modified'
       (attributes differ - AttributeDiffs lists them), 'OnlyInDifference' (created since), 'Unchanged'.
     .EXAMPLE
@@ -1285,8 +1352,10 @@ function Compare-HYCUADSnapshots {
         $seen[$guid] = $true
         if (-not $byGuid.ContainsKey($guid)) { $status = 'OnlyInReference'; $attrDiffs = @() }
         else {
-            $attrDiffs = @(Compare-HYCUADAttributeBag -Snapshot $r -Live $byGuid[$guid])
-            $status = if ($attrDiffs.Count -gt 0) { 'Modified' } else { 'Unchanged' }
+            # Direct assignment (no @()): see the note in Compare-HYCUADObjects - @() re-nests a
+            # multi-attribute diff and corrupts the count / iteration.
+            $attrDiffs = Compare-HYCUADAttributeBag -Snapshot $r -Live $byGuid[$guid]
+            $status = if (@($attrDiffs).Count -gt 0) { 'Modified' } else { 'Unchanged' }
         }
         if ($Include -contains 'All' -or $Include -contains $status) {
             $rows.Add([pscustomobject]@{
@@ -1329,8 +1398,12 @@ function Get-HYCUADObjectDiff {
 
     $snap = Get-LdapEntries -Server $Session.Server -BaseDN $SnapshotDN -Scope Base | Select-Object -First 1
     $live = Get-LdapEntries -Server $LiveServer -BaseDN $LiveDN -Scope Base -Credential $LiveCredential | Select-Object -First 1
-    if (-not $snap) { return @() }
-    return (Compare-HYCUADAttributeBag -Snapshot $snap -Live $live)
+    if (-not $snap) { return ,@() }
+    # Direct assignment (no @()): Compare-HYCUADAttributeBag already returns a leading-comma array that
+    # keeps its shape for a single diff; wrapping it in @() re-nests a multi-attribute result. The outer
+    # leading comma then preserves the array shape for this function's own callers.
+    $bag = Compare-HYCUADAttributeBag -Snapshot $snap -Live $live
+    return ,$bag
 }
 
 # ----------------------------------------------------------------------------
@@ -1424,7 +1497,7 @@ function Get-HYCUADObjectComparison {
     try { $live = Get-LdapEntries -Server $LiveServer -BaseDN $DistinguishedName -Scope Base -Credential $LiveCredential | Select-Object -First 1 } catch { $live = $null }
 
     $attrDiffs = Compare-HYCUADAttributeBag -Snapshot $snap -Live $live
-    $status = if (-not $live) { 'Deleted' } elseif ($attrDiffs.Count -gt 0) { 'Modified' } else { 'Unchanged' }
+    $status = if (-not $live) { 'Deleted' } elseif (@($attrDiffs).Count -gt 0) { 'Modified' } else { 'Unchanged' }
     [pscustomobject]@{
         Name              = [string]$snap.name
         ObjectClass       = (@($snap.objectClass) | Select-Object -Last 1)
@@ -1432,8 +1505,8 @@ function Get-HYCUADObjectComparison {
         DistinguishedName = $DistinguishedName
         ObjectGUID        = (ConvertTo-HYCUADReadableValue -Name 'objectGUID' -Value $snap.objectGUID)
         Status            = $status
-        AttributeDiffs    = $attrDiffs
-        ChangedCount      = $attrDiffs.Count
+        AttributeDiffs    = @($attrDiffs)
+        ChangedCount      = @($attrDiffs).Count
     }
 }
 
@@ -1460,8 +1533,10 @@ function Get-HYCUADObjectComparisonRows {
     try { $live = Get-LdapEntries -Server $LiveServer -BaseDN $DistinguishedName -Scope Base -Credential $LiveCredential | Select-Object -First 1 } catch { $live = $null }
 
     # Authoritative change set (sorted multi-value aware, operational attributes ignored).
-    $diffBag = @(Compare-HYCUADAttributeBag -Snapshot $snap -Live $live)
-    $diffMap = @{}; foreach ($d in $diffBag) { $diffMap[$d.Attribute] = $d.Change }
+    # Direct assignment (no @()): @() re-nests a multi-attribute diff, which made $d the whole inner
+    # array and $d.Attribute an Object[] - the hashtable write below then threw "Index operation failed".
+    $diffBag = Compare-HYCUADAttributeBag -Snapshot $snap -Live $live
+    $diffMap = @{}; foreach ($d in @($diffBag)) { $diffMap[[string]$d.Attribute] = $d.Change }
 
     $names = @($snap.PSObject.Properties.Name)
     if ($live) { $names += @($live.PSObject.Properties.Name) }
@@ -1480,11 +1555,11 @@ function Get-HYCUADObjectComparisonRows {
         }
         [pscustomobject]@{ Attribute = $n; SnapshotValue = $sv; ProductionValue = $lv; Diff = $tag; IsChanged = [bool]$changed }
     }
-    $status = if (-not $live) { 'Deleted' } elseif ($diffBag.Count -gt 0) { 'Modified' } else { 'Unchanged' }
+    $status = if (-not $live) { 'Deleted' } elseif (@($diffBag).Count -gt 0) { 'Modified' } else { 'Unchanged' }
     [pscustomobject]@{
         Exists       = [bool]$live
         Status       = $status
-        ChangedCount = $diffBag.Count
+        ChangedCount = @($diffBag).Count
         Rows         = @($rows)
         Item         = [pscustomobject]@{
             Name              = [string]$snap.name
@@ -1493,8 +1568,8 @@ function Get-HYCUADObjectComparisonRows {
             DistinguishedName = $DistinguishedName
             ObjectGUID        = (ConvertTo-HYCUADReadableValue -Name 'objectGUID' -Value $snap.objectGUID)
             Status            = $status
-            AttributeDiffs    = $diffBag
-            ChangedCount      = $diffBag.Count
+            AttributeDiffs    = @($diffBag)
+            ChangedCount      = @($diffBag).Count
         }
     }
 }
@@ -1554,7 +1629,22 @@ function Restore-HYCUADAttribute {
     $snap = Get-LdapEntries -Server $Session.Server -BaseDN $DistinguishedName -Scope Base | Select-Object -First 1
     if (-not $snap) { throw "Object absent from the snapshot: $DistinguishedName" }
 
+    # Address the LIVE object by its objectGUID when available: the comparison matches by GUID, so a
+    # moved/renamed object shows as Modified while its snapshot DN no longer resolves in production -
+    # every write via the DN would fail. The GUID follows the object wherever it lives.
+    $identity = $DistinguishedName
+    try { $identity = (New-Object Guid (,[byte[]]$snap.objectGUID)).ToString() } catch {}
+
+    # System-owned attributes the directory always rejects on -Replace (they appear in the diff of a
+    # moved/renamed object); restoring them is meaningless - the DN change IS the move.
+    $unwritable = @('distinguishedname','name','cn','objectclass')
+
+    $failed = @()
     foreach ($attr in $Attribute) {
+        if ($unwritable -contains $attr.ToLower()) {
+            Write-HYCULog "Attribute '$attr' is system-owned (a rename/move marker) and cannot be written back - skipped." 'WARN'
+            continue
+        }
         $value = if ($snap.PSObject.Properties[$attr]) { $snap.$attr } else { $null }
         $target = "{0} :: {1}" -f $DistinguishedName, $attr
         $valLabel = ConvertTo-HYCUADReadableValue -Name $attr -Value $value   # readable (byte[] -> hex/text, not 'System.Byte[]')
@@ -1569,30 +1659,40 @@ function Restore-HYCUADAttribute {
                     # null/clear branch on purpose, so a live description is preserved even when the backup
                     # had none. Set DescriptionRestoreMode='Replace' for the old overwrite behaviour.
                     $snapText = if ($null -eq $value) { '' } else { [string]$value }
-                    $liveText = ''
-                    try { $liveText = [string]((Get-ADObject -Identity $DistinguishedName -Properties description -Server $LiveServer -ErrorAction Stop).description) } catch {}
+                    $liveText = ''; $liveReadOk = $false
+                    try { $liveText = [string]((Get-ADObject -Identity $identity -Properties description -Server $LiveServer -ErrorAction Stop).description); $liveReadOk = $true } catch {}
+                    if (-not $liveReadOk) {
+                        # A failed live read must NOT masquerade as "no live description" - that would
+                        # overwrite the live value, the one thing Append mode promises never to do.
+                        throw "could not read the live 'description' (append mode refuses to risk an overwrite)"
+                    }
                     $newText  = if (-not $snapText)              { $liveText }
                                 elseif (-not $liveText)          { $snapText }
                                 elseif ($liveText -eq $snapText) { $liveText }
                                 elseif ($liveText.Contains($snapText)) { $liveText }   # already appended
                                 else { "$liveText | [backup] $snapText" }
                     if ($newText -ne $liveText) {
-                        Set-ADObject -Identity $DistinguishedName -Replace @{ description = @($newText) } -Server $LiveServer -ErrorAction Stop
+                        Set-ADObject -Identity $identity -Replace @{ description = @($newText) } -Server $LiveServer -ErrorAction Stop
                         Write-HYCULog "Attribute 'description': live value kept, backup value appended (not overwritten) on $DistinguishedName." 'SUCCESS'
                     } else {
                         Write-HYCULog "Attribute 'description': left as-is (live already covers the backup value) on $DistinguishedName." 'INFO'
                     }
                 } elseif ($null -eq $value) {
-                    Set-ADObject -Identity $DistinguishedName -Clear $attr -Server $LiveServer -ErrorAction Stop
+                    Set-ADObject -Identity $identity -Clear $attr -Server $LiveServer -ErrorAction Stop
                     Write-HYCULog "Attribute '$attr' cleared (absent from snapshot) on $DistinguishedName." 'SUCCESS'
                 } else {
                     # Keep a byte[] as ONE value; @() would split it into individual bytes.
                     $set = if ($value -is [byte[]]) { $value } else { @($value) }
-                    Set-ADObject -Identity $DistinguishedName -Replace @{ $attr = $set } -Server $LiveServer -ErrorAction Stop
+                    Set-ADObject -Identity $identity -Replace @{ $attr = $set } -Server $LiveServer -ErrorAction Stop
                     Write-HYCULog "Attribute '$attr' restored on $DistinguishedName." 'SUCCESS'
                 }
-            } catch { Write-HYCULog "Failed to restore '$attr': $_" 'ERROR' }
+            } catch { Write-HYCULog "Failed to restore '$attr': $_" 'ERROR'; $failed += $attr }
         }
+    }
+    # Propagate failures to the caller: swallowing them made Invoke-HYCUADBulkRestore (and the audit
+    # HTML report) record the item as OK although nothing - or only part - was written.
+    if ($failed.Count -gt 0) {
+        throw "Failed to restore $($failed.Count) attribute(s) on ${DistinguishedName}: $($failed -join ', ') (see the log for each error)."
     }
 }
 
@@ -1620,31 +1720,44 @@ function Update-HYCUADGroupMembership {
     Import-Module ActiveDirectory -ErrorAction Stop
     if (-not $LiveServer) { try { $LiveServer = [string]([ADSI]"LDAP://RootDSE").dnsHostName } catch {} }
     if (-not $LiveDistinguishedName) { $LiveDistinguishedName = $DistinguishedName }
-    $snap = Get-LdapEntries -Server $Session.Server -BaseDN $DistinguishedName -Scope Base -Properties 'memberOf' | Select-Object -First 1
+    $snap = Get-LdapEntries -Server $Session.Server -BaseDN $DistinguishedName -Scope Base -Properties 'memberOf','objectGUID' | Select-Object -First 1
     $snapGroups = @($snap.memberOf)
-    $liveObj = Get-ADObject -Identity $LiveDistinguishedName -Properties memberOf -Server $LiveServer
+    # When no explicit live DN was given, address the live object by its objectGUID: a moved/renamed
+    # object keeps its GUID but not its snapshot DN, so the DN identity would fail every write.
+    $identity = $LiveDistinguishedName
+    if ($LiveDistinguishedName -eq $DistinguishedName) {
+        try { $identity = (New-Object Guid (,[byte[]]$snap.objectGUID)).ToString() } catch {}
+    }
+    $liveObj = Get-ADObject -Identity $identity -Properties memberOf -Server $LiveServer
     $liveGroups = @($liveObj.memberOf)
 
     $toAdd    = $snapGroups | Where-Object { $_ -and ($liveGroups -notcontains $_) }
     $toRemove = $liveGroups | Where-Object { $_ -and ($snapGroups -notcontains $_) }
 
+    $failed = @()
     foreach ($g in $toAdd) {
         if ($PSCmdlet.ShouldProcess($g, "Add $LiveDistinguishedName as a member")) {
-            try { Add-ADGroupMember -Identity $g -Members $LiveDistinguishedName -Server $LiveServer -ErrorAction Stop
+            try { Add-ADGroupMember -Identity $g -Members $identity -Server $LiveServer -ErrorAction Stop
                   Write-HYCULog "Added to group: $g" 'SUCCESS' }
-            catch { Write-HYCULog "Failed to add to group ${g}: $_" 'ERROR' }
+            catch { Write-HYCULog "Failed to add to group ${g}: $_" 'ERROR'; $failed += $g }
         }
     }
     if ($RemoveExtra) {
         foreach ($g in $toRemove) {
             if ($PSCmdlet.ShouldProcess($g, "Remove $LiveDistinguishedName (absent from snapshot)")) {
-                try { Remove-ADGroupMember -Identity $g -Members $LiveDistinguishedName -Server $LiveServer -Confirm:$false -ErrorAction Stop
+                try { Remove-ADGroupMember -Identity $g -Members $identity -Server $LiveServer -Confirm:$false -ErrorAction Stop
                       Write-HYCULog "Removed from group: $g" 'SUCCESS' }
-                catch { Write-HYCULog "Failed to remove from group ${g}: $_" 'ERROR' }
+                catch { Write-HYCULog "Failed to remove from group ${g}: $_" 'ERROR'; $failed += $g }
             }
         }
     } elseif ($toRemove) {
         Write-HYCULog ("{0} group(s) added since the snapshot are NOT removed (use -RemoveExtra)." -f @($toRemove).Count) 'WARN'
+    }
+    # Propagate failures so a bulk restore does not record "group membership" as OK when it was not.
+    # (Restore-HYCUADObject wraps this call and downgrades to a WARN: a failed membership must not
+    # undo an otherwise successful recreation.)
+    if ($failed.Count -gt 0) {
+        throw "Failed to realign $($failed.Count) group membership(s) for ${DistinguishedName}: $($failed -join ', ')"
     }
 }
 
@@ -1745,23 +1858,33 @@ function Restore-HYCUADObject {
 
     # --- Attempt 1: AD Recycle Bin ---
     if (-not $SkipRecycleBin) {
-        try {
-            # Look up by GUID via -Identity (reliable) rather than a -Filter string comparison on the binary
-            # objectGUID; -Identity accepts the GUID and returns nothing (suppressed) if the object is gone.
-            $deleted = Get-ADObject -Identity $guid -IncludeDeletedObjects -Server $LiveServer -ErrorAction SilentlyContinue
-            if ($deleted -and $deleted.Deleted) {
-                $reanimateLabel = if ($TargetParentDN) { "Reanimate via the AD Recycle Bin into $TargetParentDN (SID preserved)" }
-                                  else { "Reanimate via the AD Recycle Bin (SID preserved)" }
-                if ($PSCmdlet.ShouldProcess($DistinguishedName, $reanimateLabel)) {
-                    $rp = @{}; if ($TargetParentDN) { $rp['TargetPath'] = $TargetParentDN }
-                    Restore-ADObject -Identity $deleted.ObjectGUID -Server $LiveServer @rp -ErrorAction Stop
-                    Write-HYCULog "Object reanimated from the AD Recycle Bin (SID preserved): $liveDN" 'SUCCESS'
-                    # Realign the groups (the Recycle Bin restores the links, but we verify)
-                    Update-HYCUADGroupMembership -Session $Session -DistinguishedName $DistinguishedName -LiveDistinguishedName $liveDN -LiveServer $LiveServer -Confirm:$false
-                    return
-                } else { return }
-            }
-        } catch { Write-HYCULog "AD Recycle Bin unavailable or object purged: $_" 'DEBUG' }
+        # Look up by GUID via -Identity (reliable). NOTE: Get-ADObject -Identity THROWS for a missing
+        # object even with -ErrorAction SilentlyContinue (AD cmdlets raise a terminating
+        # ADIdentityNotFoundException) - the try/catch below is what actually handles "purged/absent",
+        # and only the LOOKUP is inside it. A FAILED reanimation of an existing tombstone must NOT
+        # silently fall through to lossy recreation (new SID) while a perfectly reanimable tombstone
+        # (SID + password preserved) still exists - it throws instead.
+        $deleted = $null
+        try { $deleted = Get-ADObject -Identity $guid -IncludeDeletedObjects -Server $LiveServer -ErrorAction SilentlyContinue }
+        catch { Write-HYCULog "AD Recycle Bin unavailable or object purged: $_" 'DEBUG' }
+        if ($deleted -and $deleted.Deleted) {
+            $reanimateLabel = if ($TargetParentDN) { "Reanimate via the AD Recycle Bin into $TargetParentDN (SID preserved)" }
+                              else { "Reanimate via the AD Recycle Bin (SID preserved)" }
+            if ($PSCmdlet.ShouldProcess($DistinguishedName, $reanimateLabel)) {
+                $rp = @{}; if ($TargetParentDN) { $rp['TargetPath'] = $TargetParentDN }
+                try { Restore-ADObject -Identity $deleted.ObjectGUID -Server $LiveServer @rp -ErrorAction Stop }
+                catch {
+                    throw ("A reanimable tombstone exists for $DistinguishedName but Restore-ADObject failed: $_. " +
+                           "Fix the cause (e.g. restore the parent OU first, or redirect with a target OU) and retry - " +
+                           "or use -SkipRecycleBin to force recreation (which loses the original SID).")
+                }
+                Write-HYCULog "Object reanimated from the AD Recycle Bin (SID preserved): $liveDN" 'SUCCESS'
+                # Realign the groups (the Recycle Bin restores the links, but we verify).
+                try { Update-HYCUADGroupMembership -Session $Session -DistinguishedName $DistinguishedName -LiveDistinguishedName $liveDN -LiveServer $LiveServer -Confirm:$false }
+                catch { Write-HYCULog "Group memberships could not be fully re-applied on ${liveDN}: $_" 'WARN' }
+                return
+            } else { return }
+        }
     }
 
     # --- Attempt 2: recreation from the snapshot ---
@@ -1787,7 +1910,10 @@ function Restore-HYCUADObject {
             #    afterward (step 2), so that a single directory-rejected attribute (e.g. primaryGroupID -
             #    which needs the account to be a group member first - or any other system-owned value) cannot
             #    block the whole recreation.
-            switch -Regex ($leafClass) {
+            # Exact-match switch (NOT -Regex with substring patterns): 'groupPolicyContainer' used to
+            # fall into the 'group' branch (New-ADGroup with an empty SamAccountName -> guaranteed
+            # failure) instead of the generic New-ADObject default.
+            switch ($leafClass) {
                 'user' {
                     $sam = [string]$snap.sAMAccountName
                     $upn = [string]$snap.userPrincipalName
@@ -1837,7 +1963,7 @@ function Restore-HYCUADObject {
             # AD generally BLOCKS adding a SAME-DOMAIN SID as history (by design) - so it is attempted and,
             # on failure, logged as a non-fatal WARN (the object is still recreated). Disable with
             # Set-HYCUADConfig -RestoreSidHistory $false.
-            if ($script:HYCUADConfig.RestoreSidHistory -and ($leafClass -match 'user|computer|group|inetOrgPerson') `
+            if ($script:HYCUADConfig.RestoreSidHistory -and ($leafClass -match '^(user|computer|group|inetOrgPerson)$') `
                     -and $snap.PSObject.Properties['objectSid'] -and $snap.objectSid) {
                 $oldSidBytes = [byte[]]$snap.objectSid
                 $oldSid      = New-Object System.Security.Principal.SecurityIdentifier($oldSidBytes, 0)
@@ -1856,9 +1982,11 @@ function Restore-HYCUADObject {
                     Write-HYCULog "sIDHistory NOT set on ${liveDN} ($sidErr). This is EXPECTED for a SAME-DOMAIN restore: AD blocks adding a SID from the same domain as sIDHistory (by design) and there is no supported live way around it. To keep the original SID, restore from the AD Recycle Bin BEFORE the object is purged (done automatically when possible) or do an authoritative DC restore. Group memberships are re-applied regardless." 'WARN'
                 }
             }
-            # Reapply the group memberships
-            if ($leafClass -match 'user|computer|group') {
-                Update-HYCUADGroupMembership -Session $Session -DistinguishedName $DistinguishedName -LiveDistinguishedName $liveDN -LiveServer $LiveServer -Confirm:$false
+            # Reapply the group memberships (anchored match: a groupPolicyContainer is NOT a group).
+            # Membership failures must not undo a successful recreation - surface them as a WARN.
+            if ($leafClass -match '^(user|computer|group|inetOrgPerson)$') {
+                try { Update-HYCUADGroupMembership -Session $Session -DistinguishedName $DistinguishedName -LiveDistinguishedName $liveDN -LiveServer $LiveServer -Confirm:$false }
+                catch { Write-HYCULog "Group memberships could not be fully re-applied on ${liveDN}: $_" 'WARN' }
             }
         } catch { Write-HYCULog "Failed to recreate ${DistinguishedName}: $_" 'ERROR'; throw }   # re-throw so the bulk restore records this object as failed (not silently 'finished')
     }
@@ -1967,6 +2095,11 @@ function Import-HYCUADLdif {
     if ($PSCmdlet.ShouldProcess($Path, "Import into production AD")) {
         & $script:HYCUADConfig.LdifdePath -i -f $Path -j $logDir @serverArg @k 2>&1 |
             ForEach-Object { Write-HYCULog $_ 'DEBUG' }
+        # ldifde reports failure through its exit code; logging SUCCESS unconditionally hid real
+        # failures (bad DN, permission denied, constraint violation) in DEBUG lines.
+        if ($LASTEXITCODE -ne 0) {
+            throw "ldifde failed (exit $LASTEXITCODE) - see the ldif.err / ldif.log files in: $logDir"
+        }
         Write-HYCULog "LDIF import finished (logs: $logDir)." 'SUCCESS'
     }
 }
@@ -2050,10 +2183,10 @@ function Read-HYCUADRegistryPol {
         $val  = & $readString ([ref]$i)
         if ($i + 4 -gt $bytes.Length) { break }
         $type = [BitConverter]::ToUInt32($bytes, $i); $i += 4
-        if ([BitConverter]::ToUInt16($bytes, $i) -eq 0x3B) { $i += 2 }
+        if ($i + 1 -lt $bytes.Length -and [BitConverter]::ToUInt16($bytes, $i) -eq 0x3B) { $i += 2 } elseif ($i + 1 -ge $bytes.Length) { break }
         if ($i + 4 -gt $bytes.Length) { break }
         $size = [BitConverter]::ToUInt32($bytes, $i); $i += 4
-        if ([BitConverter]::ToUInt16($bytes, $i) -eq 0x3B) { $i += 2 }
+        if ($i + 1 -lt $bytes.Length -and [BitConverter]::ToUInt16($bytes, $i) -eq 0x3B) { $i += 2 } elseif ($i + 1 -ge $bytes.Length) { break }
         if ($i + $size -gt $bytes.Length) { break }
         $data = New-Object byte[] $size
         if ($size -gt 0) { [Array]::Copy($bytes, $i, $data, 0, $size) }
@@ -2201,7 +2334,10 @@ function Invoke-HYCUADBulkRestore {
             # files in SYSVOL (Registry.pol, scripts, ADMX...). Restoring the AD object alone leaves an
             # empty/stale GPO, so whenever a groupPolicyContainer is restored, also copy its {GUID} folder
             # from the snapshot SYSVOL back to production. Detected by the well-known GPO DN shape.
-            if ($it.DistinguishedName -match '^CN=(\{[0-9A-Fa-f-]+\}),CN=Policies,CN=System,') {
+            # Gated on Deleted/Modified: an item the switch above just SKIPPED (e.g. Unchanged, possible
+            # since the GUI compares with -Include All) must not have its production policy files touched.
+            if (($it.Status -eq 'Deleted' -or $it.Status -eq 'Modified') -and
+                $it.DistinguishedName -match '^CN=(\{[0-9A-Fa-f-]+\}),CN=Policies,CN=System,') {
                 $gpoGuid = $matches[1]
                 $gpoDom  = (@($it.DistinguishedName -split '(?<!\\),' | Where-Object { $_ -match '^DC=' }) -replace '^DC=','') -join '.'
                 if ($Session.SysvolPath -and (Test-Path $Session.SysvolPath)) {

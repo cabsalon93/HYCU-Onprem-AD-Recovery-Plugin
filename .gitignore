@@ -43,3 +43,11 @@ memory.md
 CLAUDE.md
 Examples.ps1
 Build-Exe.ps1
+
+# Code-signing keys / exported certificates - kept local, NOT pushed
+*.pfx
+*.p12
+*.cer
+# Local self-signed signing helper (kept local, not part of the shipped tool)
+Add-HYCUTrust.ps1
+
